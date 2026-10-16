@@ -249,48 +249,57 @@ impl Transformer {
     }
 }
 
-fn rmsnorm(o: &mut [f32], x: &[f32], weight: &[f32], size: usize) {
+fn rmsnorm(o: &mut [f32], x: &[f32], weight: &[f32]) {
+    assert_eq!(o.len(), x.len());
+    assert_eq!(o.len(), weight.len());
+
     // calculate sum of squares
     let mut ss = 0.0f32;
-    for j in 0..size {
-        ss += x[j] * x[j];
+    for x_v in x {
+        ss += x_v * x_v;
     }
-    ss /= size as f32;
+    ss /= x.len() as f32;
     ss += 1e-5;
     ss = 1.0f32 / ss.sqrt();
+
     // normalize and scale
-    for j in 0..size {
-        o[j] = weight[j] * (ss * x[j]);
+    for ((o_v, w_v), x_v) in o.iter_mut().zip(weight.iter()).zip(x.iter()) {
+        *o_v = w_v * (ss * x_v);
     }
 }
 
-fn rmsnorm_inplace(x: &mut [f32], weight: &[f32], size: usize) {
+fn rmsnorm_inplace(x: &mut [f32], weight: &[f32]) {
+    assert_eq!(x.len(), weight.len());
+
     // calculate sum of squares
     let mut ss = 0.0f32;
-    for j in 0..size {
-        ss += x[j] * x[j];
+    for x_v in x.iter() {
+        ss += x_v * x_v;
     }
-    ss /= size as f32;
+    ss /= x.len() as f32;
     ss += 1e-5;
     ss = 1.0f32 / ss.sqrt();
+
     // normalize and scale
-    for j in 0..size {
-        x[j] = weight[j] * (ss * x[j]);
+    for (x_v, w_v) in x.iter_mut().zip(weight.iter()) {
+        *x_v = w_v * (ss * *x_v);
     }
 }
 
-fn softmax(x: &mut [f32], size: usize) {
+fn softmax(x: &mut [f32]) {
     // find max value (for numerical stability)
     let max_val: f32 = x.iter().copied().reduce(f32::max).unwrap_or(0.0);
+
     // exp and sum
     let mut sum = 0.0f32;
-    for j in 0..size {
-        x[j] = (x[j] - max_val).exp();
-        sum += x[j];
+    for x_v in x.iter_mut() {
+        *x_v = (*x_v - max_val).exp();
+        sum += *x_v;
     }
+
     // normalize
-    for j in 0..size {
-        x[j] /= sum;
+    for x_v in x {
+        *x_v /= sum;
     }
 }
 
@@ -327,7 +336,7 @@ fn forward(transformer: &mut Transformer, token: usize, pos: usize) -> &mut [f32
     for l in 0..p.n_layers as usize {
         // attention rmsnorm
         let start = l * dim;
-        rmsnorm(&mut s.xb, x, &w.rms_att_weight()[start..start + dim], dim);
+        rmsnorm(&mut s.xb, x, &w.rms_att_weight()[start..start + dim]);
 
         // key and value point to the kv cache
         let loff = l * p.seq_len as usize * kv_dim;
@@ -388,7 +397,7 @@ fn forward(transformer: &mut Transformer, token: usize, pos: usize) -> &mut [f32
             }
 
             // softmax the scores to get attention weights, from 0..pos inclusively
-            softmax(att, pos + 1);
+            softmax(&mut att[..pos + 1]);
 
             // weighted sum of the values, store back into xb
             let start = h * head_size;
@@ -426,7 +435,7 @@ fn forward(transformer: &mut Transformer, token: usize, pos: usize) -> &mut [f32
 
         // ffn rmsnorm
         let start = l * dim;
-        rmsnorm(&mut s.xb, &x, &w.rms_ffn_weight()[start..start + dim], dim);
+        rmsnorm(&mut s.xb, &x, &w.rms_ffn_weight()[start..start + dim]);
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
@@ -457,7 +466,7 @@ fn forward(transformer: &mut Transformer, token: usize, pos: usize) -> &mut [f32
     }
 
     // final rmsnorm
-    rmsnorm_inplace(x, &w.rms_final_weight()[..], dim);
+    rmsnorm_inplace(x, &w.rms_final_weight()[..dim]);
 
     // classifier into logits
     matmul(
@@ -830,7 +839,7 @@ fn sample(sampler: &mut Sampler, logits: &mut [f32]) -> usize {
             logits[q] /= sampler.temperature;
         }
         // apply softmax to the logits to get the probabilities for next token
-        softmax(logits, sampler.vocab_size);
+        softmax(&mut logits[..sampler.vocab_size]);
         // flip a (float) coin (this is our source of entropy for sampling)
         let coin: f32 = rand::random();
         // we sample from this distribution to get the next token
@@ -904,8 +913,7 @@ fn generate(
 }
 
 fn main() {
-    let path =
-        Path::new("stories15M.bin");
+    let path = Path::new("stories15M.bin");
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(e) => panic!("Error opening file: {}", e),
