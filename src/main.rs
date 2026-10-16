@@ -503,9 +503,8 @@ impl Tokenizer {
 
 fn build_tokenizer(t: &mut Tokenizer, tokenizer_path: &str, vocab_size: usize) {
     t.vocab_size = vocab_size;
-    for i in 0..256 {
-        t.byte_pieces.push(i as u8);
-        t.byte_pieces.push('\0' as u8);
+    for i in 0u8..=255 {
+        t.byte_pieces.push(i);
     }
 
     let mut file = match File::open(tokenizer_path) {
@@ -541,18 +540,18 @@ fn hex_digit(c: u8) -> Option<u8> {
     }
 }
 
-fn decode(t: &Tokenizer, prev_token: i32, token: i32) -> &[u8] {
-    let mut piece: &[u8] = &t.vocab[token as usize];
+fn decode(t: &Tokenizer, prev_token: usize, token: usize) -> &[u8] {
+    let mut piece: &[u8] = &t.vocab[token];
     // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR #89)
-    if prev_token == 1 && piece[0] == ' ' as u8 {
-        piece = &t.vocab[token as usize][1..];
+    if prev_token == 1 && piece[0] == b' ' {
+        piece = &piece[1..];
     }
     // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
     // parse this and convert and return the actual byte
     if let [b'<', b'0', b'x', hi, lo, b'>'] = piece {
         if let (Some(hi), Some(lo)) = (hex_digit(*hi), hex_digit(*lo)) {
             let byte = (hi << 4) | lo;
-            let start = usize::from(byte) * 2;
+            let start = usize::from(byte);
             return &t.byte_pieces[start..start + 1];
         }
     }
@@ -586,14 +585,7 @@ fn str_lookup(piece: &[u8], sorted_vocab: &[TokenIndex]) -> Option<usize> {
         .map(|index| sorted_vocab[index].id)
 }
 
-fn encode(
-    t: &mut Tokenizer,
-    text: &[u8],
-    bos: i8,
-    eos: i8,
-    tokens: &mut [i32],
-    n_tokens: &mut i32,
-) {
+fn encode(t: &mut Tokenizer, text: &[u8], bos: bool, eos: bool, tokens: &mut Vec<usize>) {
     if t.sorted_vocab.is_empty() {
         for i in 0..t.vocab_size {
             t.sorted_vocab.push(TokenIndex {
@@ -607,13 +599,9 @@ fn encode(
 
     let mut str_buffer: Vec<u8> = Vec::new();
 
-    // start at 0 tokens
-    let mut n_tokens_val = 0;
-
     // add optional BOS (=1) token, if desired
-    if bos != 0 {
-        tokens[n_tokens_val] = 1;
-        n_tokens_val += 1;
+    if bos {
+        tokens.push(1);
     }
 
     // add_dummy_prefix is true by default
@@ -622,8 +610,7 @@ fn encode(
     // energy to read more of the sentencepiece code to figure out what it's doing
     if text.first().is_some_and(|&b| b != 0) {
         let dummy_prefix = str_lookup(b" ", &t.sorted_vocab);
-        tokens[n_tokens_val] = dummy_prefix.unwrap() as i32;
-        n_tokens_val += 1;
+        tokens.push(dummy_prefix.unwrap());
     }
 
     // Okay UTF-8 time. This will get messy. Here is the reference from Wikipedia:
@@ -664,15 +651,13 @@ fn encode(
 
         if let Some(id) = id {
             // we found this codepoint in vocab, add it as a token
-            tokens[n_tokens_val] = id as i32;
-            n_tokens_val += 1;
+            tokens.push(id);
         } else {
             // byte_fallback encoding: just encode each byte as a token
             // +3 is here because the first 3 vocab elements are <unk>, <s>, </s>
             // so the individual bytes only start at index 3
             for &buf in &str_buffer {
-                tokens[n_tokens_val] = i32::from(buf) + 3;
-                n_tokens_val += 1;
+                tokens.push(buf as usize + 3);
             }
         }
         str_buffer.clear(); // protect against a sequence of stray UTF8 continuation bytes
@@ -681,45 +666,39 @@ fn encode(
     // merge the best consecutive pair each iteration, according the scores in vocab_scores
     loop {
         let mut best_score = -1e10f32;
-        let mut best_id = -1;
-        let mut best_idx = -1;
+        let mut best_id = 0;
+        let mut best_idx = tokens.len();
 
-        for i in 0..n_tokens_val.saturating_sub(1) {
+        for i in 0..tokens.len().saturating_sub(1) {
             // check if we can merge the pair (tokens[i], tokens[i+1])
             str_buffer.clear();
-            str_buffer.extend_from_slice(&t.vocab[tokens[i] as usize]);
-            str_buffer.extend_from_slice(&t.vocab[tokens[i + 1] as usize]);
+            str_buffer.extend_from_slice(&t.vocab[tokens[i]]);
+            str_buffer.extend_from_slice(&t.vocab[tokens[i + 1]]);
             let id = str_lookup(&str_buffer, &t.sorted_vocab);
             if let Some(id) = id
                 && t.vocab_scores[id] > best_score
             {
                 // this merge pair exists in vocab! record its score and position
                 best_score = t.vocab_scores[id];
-                best_id = id as i32;
-                best_idx = i as i32;
+                best_id = id;
+                best_idx = i;
             }
         }
 
-        if best_idx == -1 {
-            break; // we couldn't find any more pairs to merge, so we're done
+        if best_idx == tokens.len() {
+            break;
         }
 
         // merge the consecutive pair (best_idx, best_idx+1) into new token best_id
-        tokens[best_idx as usize] = best_id;
+        tokens[best_idx] = best_id;
         // delete token at position best_idx+1, shift the entire sequence back 1
-        for i in (best_idx + 1) as usize..n_tokens_val - 1 {
-            tokens[i] = tokens[i + 1];
-        }
-        n_tokens_val -= 1;
+        tokens.remove(best_idx + 1);
     }
 
     // add optional EOS (=2) token, if desired
-    if eos != 0 {
-        tokens[n_tokens_val] = 2;
-        n_tokens_val += 1;
+    if eos {
+        tokens.push(2);
     }
-
-    *n_tokens = i32::try_from(n_tokens_val).expect("n_token_val exceeds i32");
 }
 
 struct ProbIndex {
@@ -745,35 +724,31 @@ impl Sampler {
     }
 }
 
-fn sample_argmax(probabilities: &[f32], n: usize) -> usize {
+fn sample_argmax(probabilities: &[f32]) -> usize {
     // return the index that has the highest probability
-    let mut max_i = 0;
-    let mut max_p = probabilities[0];
-    for i in 1..n {
-        if probabilities[i] > max_p {
-            max_i = i;
-            max_p = probabilities[i];
-        }
-    }
-    max_i
+    probabilities
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(i, _)| i)
+        .unwrap_or(0)
 }
 
-fn sample_mult(probabilities: &[f32], n: usize, coin: f32) -> usize {
+fn sample_mult(probabilities: &[f32], coin: f32) -> usize {
     // sample index from probabilities (they must sum to 1!)
     // coin is a random number in [0, 1), usually from random_f32()
     let mut cdf = 0.0f32;
-    for i in 0..n {
-        cdf += probabilities[i];
+    for (idx, prob) in probabilities.iter().enumerate() {
+        cdf += prob;
         if coin < cdf {
-            return i;
+            return idx;
         }
     }
-    n - 1 // in case of rounding errors
+    probabilities.len() - 1 // in case of rounding errors
 }
 
 fn sample_topp(
     probabilities: &[f32],
-    n: usize,
     topp: f32,
     probindex: &mut Vec<ProbIndex>,
     coin: f32,
@@ -787,13 +762,10 @@ fn sample_topp(
     // quicksort indices in descending order of probabilities
     // values smaller than (1 - topp) / (n - 1) cannot be part of the result
     // so for efficiency we crop these out as candidates before sorting
-    let cutoff = (1.0f32 - topp) / (n - 1) as f32;
-    for i in 0..n {
-        if probabilities[i] >= cutoff {
-            probindex.push(ProbIndex {
-                index: i,
-                prob: probabilities[i],
-            });
+    let cutoff = (1.0f32 - topp) / (probabilities.len() - 1) as f32;
+    for (index, &prob) in probabilities.iter().enumerate() {
+        if prob >= cutoff {
+            probindex.push(ProbIndex { index, prob })
         }
     }
     probindex.sort_by(|a, b| b.prob.total_cmp(&a.prob));
@@ -801,10 +773,10 @@ fn sample_topp(
     // truncate the list where cumulative probability exceeds topp
     let mut cumulative_prob = 0.0f32;
     let mut last_index = probindex.len() - 1; // in case of rounding errors consider all elements
-    for i in 0..probindex.len() {
-        cumulative_prob += probindex[i].prob;
+    for (idx, prob_idx) in probindex.iter().enumerate() {
+        cumulative_prob += prob_idx.prob;
         if cumulative_prob > topp {
-            last_index = i;
+            last_index = idx;
             break; // we've exceeded topp by including last_idx
         }
     }
@@ -823,35 +795,30 @@ fn sample_topp(
 
 fn sample(sampler: &mut Sampler, logits: &mut [f32]) -> usize {
     // sample the token given the logits and some hyperparameters
-    let next;
     if sampler.temperature == 0.0 {
         // greedy argmax sampling: take the token with the highest probability
-        next = sample_argmax(logits, sampler.vocab_size);
-    } else {
-        // apply the temperature to the logits
-        for q in 0..sampler.vocab_size {
-            logits[q] /= sampler.temperature;
-        }
-        // apply softmax to the logits to get the probabilities for next token
-        softmax(&mut logits[..sampler.vocab_size]);
-        // flip a (float) coin (this is our source of entropy for sampling)
-        let coin: f32 = rand::random();
-        // we sample from this distribution to get the next token
-        if sampler.topp <= 0.0 || sampler.topp >= 1.0 {
-            // simply sample from the predicted probability distribution
-            next = sample_mult(logits, sampler.vocab_size, coin);
-        } else {
-            // top-p (nucleus) sampling, clamping the least likely tokens to zero
-            next = sample_topp(
-                logits,
-                sampler.vocab_size,
-                sampler.topp,
-                &mut sampler.probindex,
-                coin,
-            );
-        }
+        return sample_argmax(logits);
     }
-    next
+
+    // apply the temperature to the logits
+    for q in 0..sampler.vocab_size {
+        logits[q] /= sampler.temperature;
+    }
+
+    // apply softmax to the logits to get the probabilities for next token
+    softmax(&mut logits[..sampler.vocab_size]);
+
+    // flip a (float) coin (this is our source of entropy for sampling)
+    let coin: f32 = rand::random();
+
+    // we sample from this distribution to get the next token
+    if sampler.topp <= 0.0 || sampler.topp >= 1.0 {
+        // simply sample from the predicted probability distribution
+        return sample_mult(logits, coin);
+    }
+
+    // top-p (nucleus) sampling, clamping the least likely tokens to zero
+    sample_topp(logits, sampler.topp, &mut sampler.probindex, coin)
 }
 
 fn generate(
@@ -859,18 +826,12 @@ fn generate(
     mut tokenizer: Tokenizer,
     mut sampler: Sampler,
     prompt: &[u8],
-    steps: i32,
+    steps: usize,
 ) {
-    let mut num_prompt_tokens = 0;
-    let mut prompt_tokens: Vec<i32> = vec![0; prompt.len() + 3];
-    encode(
-        &mut tokenizer,
-        prompt,
-        1,
-        0,
-        &mut prompt_tokens,
-        &mut num_prompt_tokens,
-    );
+    let mut prompt_tokens: Vec<usize> = vec![];
+    encode(&mut tokenizer, prompt, true, false, &mut prompt_tokens);
+
+    let num_prompt_tokens = prompt_tokens.len();
     if num_prompt_tokens < 1 {
         panic!("something is wrong, expected at least 1 prompt token")
     }
@@ -878,18 +839,18 @@ fn generate(
     // start the main loop
     let mut next;
     let mut token = prompt_tokens[0];
-    let mut pos = 0usize;
-    while pos < steps as usize {
+    let mut pos = 0;
+    while pos < steps {
         // forward the transformer to get logits for the next token
-        let logits: &mut [f32] = forward(&mut transformer, token as usize, pos);
+        let logits: &mut [f32] = forward(&mut transformer, token, pos);
 
         // advance the state machine
-        if pos < (num_prompt_tokens - 1) as usize {
+        if pos < num_prompt_tokens - 1 {
             // if we are still processing the input prompt, force the next prompt token
             next = prompt_tokens[pos + 1];
         } else {
             // otherwise sample the next token from the logits
-            next = sample(&mut sampler, logits.as_mut()) as i32;
+            next = sample(&mut sampler, logits.as_mut());
         }
         pos += 1;
 
