@@ -8,13 +8,13 @@ use std::path::Path;
 use std::{fs, io};
 
 struct Config {
-    dim: i32,        // transformer dimension
-    hidden_dim: i32, // for ffn layers
-    n_layers: i32,   // number of layers
-    n_heads: i32,    // number of query heads
-    n_kv_heads: i32, // number of key/value heads (can be < query heads because of multiquery)
-    vocab_size: i32, // vocabulary size, usually 256 (byte-level)
-    seq_len: i32,    // max sequence length
+    dim: usize,        // transformer dimension
+    hidden_dim: usize, // for ffn layers
+    n_layers: usize,   // number of layers
+    n_heads: usize,    // number of query heads
+    n_kv_heads: usize, // number of key/value heads (can be < query heads because of multiquery)
+    vocab_size: usize, // vocabulary size, usually 256 (byte-level)
+    seq_len: usize,    // max sequence length
     shared_weights: bool,
 }
 
@@ -23,13 +23,13 @@ impl Config {
         let vocab_size = i32::from_le_bytes(bytes[20..24].try_into().unwrap());
         let shared_weights = vocab_size > 0;
         Ok(Self {
-            dim: i32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-            hidden_dim: i32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-            n_layers: i32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-            n_heads: i32::from_le_bytes(bytes[12..16].try_into().unwrap()),
-            n_kv_heads: i32::from_le_bytes(bytes[16..20].try_into().unwrap()),
-            vocab_size: vocab_size.abs(),
-            seq_len: i32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            dim: i32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize,
+            hidden_dim: i32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize,
+            n_layers: i32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize,
+            n_heads: i32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize,
+            n_kv_heads: i32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize,
+            vocab_size: vocab_size.abs() as usize,
+            seq_len: i32::from_le_bytes(bytes[24..28].try_into().unwrap()) as usize,
             shared_weights,
         })
     }
@@ -65,13 +65,13 @@ struct TransformerWeights {
 
 impl TransformerWeights {
     fn try_from(data: Vec<f32>, config: &Config) -> Result<Self, std::io::Error> {
-        let dim = config.dim as usize;
-        let hidden_dim = config.hidden_dim as usize;
-        let n_layers = config.n_layers as usize;
-        let n_heads = config.n_heads as usize;
-        let n_kv_heads = config.n_kv_heads as usize;
-        let seq_len = config.seq_len as usize;
-        let vocab_size = config.vocab_size as usize;
+        let dim = config.dim;
+        let hidden_dim = config.hidden_dim;
+        let n_layers = config.n_layers;
+        let n_heads = config.n_heads;
+        let n_kv_heads = config.n_kv_heads;
+        let seq_len = config.seq_len;
+        let vocab_size = config.vocab_size;
         let head_size = dim / n_heads;
 
         let mut start: usize = 7; // Config size, 7 i32
@@ -322,24 +322,24 @@ fn forward(transformer: &mut Transformer, token: usize, pos: usize) -> &mut [f32
     let s = &mut transformer.state;
 
     let x = &mut s.x;
-    let dim = p.dim as usize;
-    let kv_dim = ((p.dim * p.n_kv_heads) / p.n_heads) as usize;
-    let kv_mul = (p.n_heads / p.n_kv_heads) as usize;
-    let hidden_dim = p.hidden_dim as usize;
-    let head_size = dim / p.n_heads as usize;
+    let dim = p.dim;
+    let kv_dim = (p.dim * p.n_kv_heads) / p.n_heads;
+    let kv_mul = p.n_heads / p.n_kv_heads;
+    let hidden_dim = p.hidden_dim;
+    let head_size = dim / p.n_heads;
 
     // copy the token embedding into x
     let start = token * dim;
     x.copy_from_slice(&w.token_embedding_table()[start..start + dim]);
 
     // forward all the layers
-    for l in 0..p.n_layers as usize {
+    for l in 0..p.n_layers {
         // attention rmsnorm
         let start = l * dim;
         rmsnorm(&mut s.xb, x, &w.rms_att_weight()[start..start + dim]);
 
         // key and value point to the kv cache
-        let loff = l * p.seq_len as usize * kv_dim;
+        let loff = l * p.seq_len * kv_dim;
         let start = loff + pos * kv_dim;
 
         let k = &mut s.key_cache[start..start + kv_dim];
@@ -371,14 +371,14 @@ fn forward(transformer: &mut Transformer, token: usize, pos: usize) -> &mut [f32
         }
 
         // multihead attention. iterate over all heads
-        for h in 0..p.n_heads as usize {
+        for h in 0..p.n_heads {
             // get the query vector for this head
             let start = h * head_size;
             let q = &s.q[start..start + head_size];
 
             // attention scores for this head
-            let start = h * p.seq_len as usize;
-            let att = &mut s.att[start..start + p.seq_len as usize];
+            let start = h * p.seq_len;
+            let att = &mut s.att[start..start + p.seq_len];
 
             // iterate over all timesteps, including the current one
             for t in 0..=pos {
@@ -469,20 +469,14 @@ fn forward(transformer: &mut Transformer, token: usize, pos: usize) -> &mut [f32
     rmsnorm_inplace(x, &w.rms_final_weight()[..dim]);
 
     // classifier into logits
-    matmul(
-        &mut s.logits,
-        x,
-        w.wcls(),
-        p.dim as usize,
-        p.vocab_size as usize,
-    );
+    matmul(&mut s.logits, x, w.wcls(), p.dim, p.vocab_size);
 
     &mut s.logits
 }
 
 struct TokenIndex {
     str: Vec<u8>,
-    id: i32,
+    id: usize,
 }
 
 struct Tokenizer {
@@ -585,7 +579,7 @@ fn safe_print(piece: &[u8]) -> io::Result<()> {
     out.write_all(piece)
 }
 
-fn str_lookup(piece: &[u8], sorted_vocab: &[TokenIndex], vocab_size: usize) -> Option<i32> {
+fn str_lookup(piece: &[u8], sorted_vocab: &[TokenIndex]) -> Option<usize> {
     sorted_vocab
         .binary_search_by(|x| x.str.as_slice().cmp(piece))
         .ok()
@@ -603,7 +597,7 @@ fn encode(
     if t.sorted_vocab.is_empty() {
         for i in 0..t.vocab_size {
             t.sorted_vocab.push(TokenIndex {
-                id: i as i32,
+                id: i,
                 str: t.vocab[i].clone(),
             });
         }
@@ -627,8 +621,8 @@ fn encode(
     // TODO: pretty sure this isn't correct in the general case but I don't have the
     // energy to read more of the sentencepiece code to figure out what it's doing
     if text.first().is_some_and(|&b| b != 0) {
-        let dummy_prefix = str_lookup(b" ", &t.sorted_vocab, t.vocab_size);
-        tokens[n_tokens_val] = dummy_prefix.unwrap();
+        let dummy_prefix = str_lookup(b" ", &t.sorted_vocab);
+        tokens[n_tokens_val] = dummy_prefix.unwrap() as i32;
         n_tokens_val += 1;
     }
 
@@ -666,11 +660,11 @@ fn encode(
             continue;
         }
 
-        let id = str_lookup(&str_buffer, &t.sorted_vocab, t.vocab_size);
+        let id = str_lookup(&str_buffer, &t.sorted_vocab);
 
         if let Some(id) = id {
             // we found this codepoint in vocab, add it as a token
-            tokens[n_tokens_val] = id;
+            tokens[n_tokens_val] = id as i32;
             n_tokens_val += 1;
         } else {
             // byte_fallback encoding: just encode each byte as a token
@@ -695,13 +689,13 @@ fn encode(
             str_buffer.clear();
             str_buffer.extend_from_slice(&t.vocab[tokens[i] as usize]);
             str_buffer.extend_from_slice(&t.vocab[tokens[i + 1] as usize]);
-            let id = str_lookup(&str_buffer, &t.sorted_vocab, t.vocab_size);
+            let id = str_lookup(&str_buffer, &t.sorted_vocab);
             if let Some(id) = id
-                && t.vocab_scores[id as usize] > best_score
+                && t.vocab_scores[id] > best_score
             {
                 // this merge pair exists in vocab! record its score and position
-                best_score = t.vocab_scores[id as usize];
-                best_id = id;
+                best_score = t.vocab_scores[id];
+                best_id = id as i32;
                 best_idx = i as i32;
             }
         }
@@ -882,7 +876,7 @@ fn generate(
     }
 
     // start the main loop
-    let mut next = 0;
+    let mut next;
     let mut token = prompt_tokens[0];
     let mut pos = 0usize;
     while pos < steps as usize {
@@ -923,7 +917,7 @@ fn main() {
     file.read_exact(&mut bytes).unwrap();
 
     let config = Config::try_from(&bytes).unwrap();
-    let vocab_size = config.vocab_size as usize;
+    let vocab_size = config.vocab_size;
 
     let data: Vec<u8> = fs::read(path).unwrap();
     let data: Vec<f32> = data
@@ -935,11 +929,11 @@ fn main() {
 
     let kv_dim = (config.dim * config.n_kv_heads) / config.n_heads;
     let state = RunState::new(
-        config.dim as usize,
-        config.hidden_dim as usize,
-        (config.n_heads * config.seq_len) as usize,
+        config.dim,
+        config.hidden_dim,
+        config.n_heads * config.seq_len,
         vocab_size,
-        (config.n_layers * config.seq_len * kv_dim) as usize,
+        config.n_layers * config.seq_len * kv_dim,
     );
 
     let transformer = Transformer::new(config, weights, state);
