@@ -708,7 +708,6 @@ struct ProbIndex {
 
 struct Sampler {
     vocab_size: usize,
-    probindex: Vec<ProbIndex>, // buffer used in top-p sampling
     temperature: f32,
     topp: f32,
 }
@@ -717,114 +716,108 @@ impl Sampler {
     fn new(vocab_size: usize, temperature: f32, topp: f32) -> Self {
         Self {
             vocab_size,
-            probindex: vec![],
             temperature,
             topp,
         }
     }
-}
 
-fn sample_argmax(probabilities: &[f32]) -> usize {
-    // return the index that has the highest probability
-    probabilities
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
-        .map(|(i, _)| i)
-        .unwrap_or(0)
-}
-
-fn sample_mult(probabilities: &[f32], coin: f32) -> usize {
-    // sample index from probabilities (they must sum to 1!)
-    // coin is a random number in [0, 1), usually from random_f32()
-    let mut cdf = 0.0f32;
-    for (idx, prob) in probabilities.iter().enumerate() {
-        cdf += prob;
-        if coin < cdf {
-            return idx;
+    fn sample(&self, logits: &mut [f32]) -> usize {
+        // sample the token given the logits and some hyperparameters
+        if self.temperature == 0.0 {
+            // greedy argmax sampling: take the token with the highest probability
+            return Self::sample_argmax(logits);
         }
-    }
-    probabilities.len() - 1 // in case of rounding errors
-}
 
-fn sample_topp(
-    probabilities: &[f32],
-    topp: f32,
-    probindex: &mut Vec<ProbIndex>,
-    coin: f32,
-) -> usize {
-    // top-p sampling (or "nucleus sampling") samples from the smallest set of
-    // tokens that exceed probability topp. This way we never sample tokens that
-    // have very low probabilities and are less likely to go "off the rails".
-    // coin is a random number in [0, 1), usually from random_f32()
-    probindex.clear();
-
-    // quicksort indices in descending order of probabilities
-    // values smaller than (1 - topp) / (n - 1) cannot be part of the result
-    // so for efficiency we crop these out as candidates before sorting
-    let cutoff = (1.0f32 - topp) / (probabilities.len() - 1) as f32;
-    for (index, &prob) in probabilities.iter().enumerate() {
-        if prob >= cutoff {
-            probindex.push(ProbIndex { index, prob })
+        // apply the temperature to the logits
+        for q in 0..self.vocab_size {
+            logits[q] /= self.temperature;
         }
-    }
-    probindex.sort_by(|a, b| b.prob.total_cmp(&a.prob));
 
-    // truncate the list where cumulative probability exceeds topp
-    let mut cumulative_prob = 0.0f32;
-    let mut last_index = probindex.len() - 1; // in case of rounding errors consider all elements
-    for (idx, prob_idx) in probindex.iter().enumerate() {
-        cumulative_prob += prob_idx.prob;
-        if cumulative_prob > topp {
-            last_index = idx;
-            break; // we've exceeded topp by including last_idx
+        // apply softmax to the logits to get the probabilities for next token
+        softmax(&mut logits[..self.vocab_size]);
+
+        // flip a (float) coin (this is our source of entropy for sampling)
+        let coin: f32 = rand::random();
+
+        // we sample from this distribution to get the next token
+        if self.topp <= 0.0 || self.topp >= 1.0 {
+            // simply sample from the predicted probability distribution
+            return Self::sample_mult(logits, coin);
         }
+
+        // top-p (nucleus) sampling, clamping the least likely tokens to zero
+        Self::sample_topp(logits, self.topp, coin)
     }
 
-    // sample from the truncated list
-    let r = coin * cumulative_prob;
-    let mut cdf = 0.0f32;
-    for i in 0..=last_index {
-        cdf += probindex[i].prob;
-        if r < cdf {
-            return probindex[i].index;
+    fn sample_argmax(probabilities: &[f32]) -> usize {
+        // return the index that has the highest probability
+        probabilities
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    }
+
+    fn sample_mult(probabilities: &[f32], coin: f32) -> usize {
+        // sample index from probabilities (they must sum to 1!)
+        // coin is a random number in [0, 1), usually from random_f32()
+        let mut cdf = 0.0f32;
+        for (idx, prob) in probabilities.iter().enumerate() {
+            cdf += prob;
+            if coin < cdf {
+                return idx;
+            }
         }
-    }
-    probindex[last_index].index // in case of rounding errors
-}
-
-fn sample(sampler: &mut Sampler, logits: &mut [f32]) -> usize {
-    // sample the token given the logits and some hyperparameters
-    if sampler.temperature == 0.0 {
-        // greedy argmax sampling: take the token with the highest probability
-        return sample_argmax(logits);
+        probabilities.len() - 1 // in case of rounding errors
     }
 
-    // apply the temperature to the logits
-    for q in 0..sampler.vocab_size {
-        logits[q] /= sampler.temperature;
+    fn sample_topp(probabilities: &[f32], topp: f32, coin: f32) -> usize {
+        // top-p sampling (or "nucleus sampling") samples from the smallest set of
+        // tokens that exceed probability topp. This way we never sample tokens that
+        // have very low probabilities and are less likely to go "off the rails".
+        // coin is a random number in [0, 1), usually from random_f32()
+        let mut probindex = Vec::new();
+
+        // quicksort indices in descending order of probabilities
+        // values smaller than (1 - topp) / (n - 1) cannot be part of the result
+        // so for efficiency we crop these out as candidates before sorting
+        let cutoff = (1.0f32 - topp) / (probabilities.len() - 1) as f32;
+        for (index, &prob) in probabilities.iter().enumerate() {
+            if prob >= cutoff {
+                probindex.push(ProbIndex { index, prob })
+            }
+        }
+        probindex.sort_by(|a, b| b.prob.total_cmp(&a.prob));
+
+        // truncate the list where cumulative probability exceeds topp
+        let mut cumulative_prob = 0.0f32;
+        let mut last_index = probindex.len() - 1; // in case of rounding errors consider all elements
+        for (idx, prob_idx) in probindex.iter().enumerate() {
+            cumulative_prob += prob_idx.prob;
+            if cumulative_prob > topp {
+                last_index = idx;
+                break; // we've exceeded topp by including last_idx
+            }
+        }
+
+        // sample from the truncated list
+        let r = coin * cumulative_prob;
+        let mut cdf = 0.0f32;
+        for i in 0..=last_index {
+            cdf += probindex[i].prob;
+            if r < cdf {
+                return probindex[i].index;
+            }
+        }
+        probindex[last_index].index // in case of rounding errors
     }
-
-    // apply softmax to the logits to get the probabilities for next token
-    softmax(&mut logits[..sampler.vocab_size]);
-
-    // flip a (float) coin (this is our source of entropy for sampling)
-    let coin: f32 = rand::random();
-
-    // we sample from this distribution to get the next token
-    if sampler.topp <= 0.0 || sampler.topp >= 1.0 {
-        // simply sample from the predicted probability distribution
-        return sample_mult(logits, coin);
-    }
-
-    // top-p (nucleus) sampling, clamping the least likely tokens to zero
-    sample_topp(logits, sampler.topp, &mut sampler.probindex, coin)
 }
 
 fn generate(
     mut transformer: Transformer,
     mut tokenizer: Tokenizer,
-    mut sampler: Sampler,
+    sampler: Sampler,
     prompt: &[u8],
     steps: usize,
 ) {
@@ -850,7 +843,7 @@ fn generate(
             next = prompt_tokens[pos + 1];
         } else {
             // otherwise sample the next token from the logits
-            next = sample(&mut sampler, logits.as_mut());
+            next = sampler.sample(logits.as_mut());
         }
         pos += 1;
 
