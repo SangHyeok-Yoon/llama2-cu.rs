@@ -247,6 +247,165 @@ impl Transformer {
             state,
         }
     }
+
+    fn forward(&mut self, token: usize, pos: usize) -> &mut [f32] {
+        // a few convenience variables
+        let p = &mut self.config;
+        let w = &mut self.weights;
+        let s = &mut self.state;
+
+        let x = &mut s.x;
+        let dim = p.dim;
+        let kv_dim = (p.dim * p.n_kv_heads) / p.n_heads;
+        let kv_mul = p.n_heads / p.n_kv_heads;
+        let hidden_dim = p.hidden_dim;
+        let head_size = dim / p.n_heads;
+
+        // copy the token embedding into x
+        let start = token * dim;
+        x.copy_from_slice(&w.token_embedding_table()[start..start + dim]);
+
+        // forward all the layers
+        for l in 0..p.n_layers {
+            // attention rmsnorm
+            let start = l * dim;
+            rmsnorm(&mut s.xb, x, &w.rms_att_weight()[start..start + dim]);
+
+            // key and value point to the kv cache
+            let loff = l * p.seq_len * kv_dim;
+            let start = loff + pos * kv_dim;
+
+            let k = &mut s.key_cache[start..start + kv_dim];
+            let v = &mut s.value_cache[start..start + kv_dim];
+
+            // qkv matmuls for this position
+            let start = l * dim * dim;
+            matmul(&mut s.q, &s.xb, &w.wq()[start..start + dim * dim], dim, dim);
+
+            let start = l * kv_dim * dim;
+            matmul(k, &s.xb, &w.wk()[start..start + kv_dim * dim], dim, kv_dim);
+            matmul(v, &s.xb, &w.wv()[start..start + kv_dim * dim], dim, kv_dim);
+
+            // RoPE relative positional encoding:: complex-valued rotate q and k in each head
+            for i in (0..dim).step_by(2) {
+                let head_dim = i % head_size;
+                let freq = 1.0f32 / 10000.0f32.powf(head_dim as f32 / head_size as f32);
+                let val = pos as f32 * freq;
+                let fcr = val.cos();
+                let fci = val.sin();
+                let rotn = if i < kv_dim { 2 } else { 1 };
+                for v in 0..rotn {
+                    let vec = if v == 0 { &mut s.q } else { &mut *k };
+                    let v0 = vec[i];
+                    let v1 = vec[i + 1];
+                    vec[i] = v0 * fcr - v1 * fci;
+                    vec[i + 1] = v0 * fci + v1 * fcr;
+                }
+            }
+
+            // multihead attention. iterate over all heads
+            for h in 0..p.n_heads {
+                // get the query vector for this head
+                let start = h * head_size;
+                let q = &s.q[start..start + head_size];
+
+                // attention scores for this head
+                let start = h * p.seq_len;
+                let att = &mut s.att[start..start + p.seq_len];
+
+                // iterate over all timesteps, including the current one
+                for t in 0..=pos {
+                    // get the key vector for this head and at this timestep
+                    let start = loff + t * kv_dim + (h / kv_mul) * head_size;
+                    let k = &s.key_cache[start..start + head_size];
+
+                    // calculate the attention score as the dot product of q and k
+                    let mut score = 0.0f32;
+                    for i in 0..head_size {
+                        score += q[i] * k[i];
+                    }
+                    score /= (head_size as f32).sqrt();
+                    // save the score to the attention buffer
+                    att[t] = score;
+                }
+
+                // softmax the scores to get attention weights, from 0..pos inclusively
+                softmax(&mut att[..pos + 1]);
+
+                // weighted sum of the values, store back into xb
+                let start = h * head_size;
+                let xb = &mut s.xb[start..start + head_size];
+                xb.fill(0.0);
+
+                for t in 0..=pos {
+                    // get the value vector for this head and at this timestep
+                    let start = loff + t * kv_dim + (h / kv_mul) * head_size;
+                    let v = &s.value_cache[start..start + head_size];
+
+                    // get the attention weight for this timestep
+                    let a = att[t];
+                    // accumulate the weighted value into xb
+                    for i in 0..head_size {
+                        xb[i] += a * v[i];
+                    }
+                }
+            }
+
+            // final matmul to get the output of the attention
+            let start = l * dim * dim;
+            matmul(
+                &mut s.xb2,
+                &s.xb,
+                &w.wo()[start..start + dim * dim],
+                dim,
+                dim,
+            );
+
+            // residual connection back into x
+            for i in 0..dim {
+                x[i] += s.xb2[i];
+            }
+
+            // ffn rmsnorm
+            let start = l * dim;
+            rmsnorm(&mut s.xb, &x, &w.rms_ffn_weight()[start..start + dim]);
+
+            // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
+            // first calculate self.w1(x) and self.w3(x)
+            let start = l * dim * hidden_dim;
+            let end = start + dim * hidden_dim;
+            matmul(&mut s.hb, &s.xb, &w.w1()[start..end], dim, hidden_dim);
+            matmul(&mut s.hb2, &s.xb, &w.w3()[start..end], dim, hidden_dim);
+
+            // SwiGLU non-linearity
+            for i in 0..hidden_dim {
+                let mut val = s.hb[i];
+                // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+                val *= 1.0 / (1.0 + (-val).exp());
+                // elementwise multiply with w3(x)
+                val *= s.hb2[i];
+                s.hb[i] = val;
+            }
+
+            // final matmul to get the output of the ffn
+            let start = l * dim * hidden_dim;
+            let end = start + hidden_dim * dim;
+            matmul(&mut s.xb, &s.hb, &w.w2()[start..end], hidden_dim, dim);
+
+            // residual connection
+            for i in 0..dim {
+                x[i] += s.xb[i];
+            }
+        }
+
+        // final rmsnorm
+        rmsnorm_inplace(x, &w.rms_final_weight()[..dim]);
+
+        // classifier into logits
+        matmul(&mut s.logits, x, w.wcls(), p.dim, p.vocab_size);
+
+        &mut s.logits
+    }
 }
 
 fn rmsnorm(o: &mut [f32], x: &[f32], weight: &[f32]) {
@@ -315,165 +474,6 @@ fn matmul(xout: &mut [f32], x: &[f32], w: &[f32], n: usize, d: usize) {
     }
 }
 
-fn forward(transformer: &mut Transformer, token: usize, pos: usize) -> &mut [f32] {
-    // a few convenience variables
-    let p = &mut transformer.config;
-    let w = &mut transformer.weights;
-    let s = &mut transformer.state;
-
-    let x = &mut s.x;
-    let dim = p.dim;
-    let kv_dim = (p.dim * p.n_kv_heads) / p.n_heads;
-    let kv_mul = p.n_heads / p.n_kv_heads;
-    let hidden_dim = p.hidden_dim;
-    let head_size = dim / p.n_heads;
-
-    // copy the token embedding into x
-    let start = token * dim;
-    x.copy_from_slice(&w.token_embedding_table()[start..start + dim]);
-
-    // forward all the layers
-    for l in 0..p.n_layers {
-        // attention rmsnorm
-        let start = l * dim;
-        rmsnorm(&mut s.xb, x, &w.rms_att_weight()[start..start + dim]);
-
-        // key and value point to the kv cache
-        let loff = l * p.seq_len * kv_dim;
-        let start = loff + pos * kv_dim;
-
-        let k = &mut s.key_cache[start..start + kv_dim];
-        let v = &mut s.value_cache[start..start + kv_dim];
-
-        // qkv matmuls for this position
-        let start = l * dim * dim;
-        matmul(&mut s.q, &s.xb, &w.wq()[start..start + dim * dim], dim, dim);
-
-        let start = l * kv_dim * dim;
-        matmul(k, &s.xb, &w.wk()[start..start + kv_dim * dim], dim, kv_dim);
-        matmul(v, &s.xb, &w.wv()[start..start + kv_dim * dim], dim, kv_dim);
-
-        // RoPE relative positional encoding:: complex-valued rotate q and k in each head
-        for i in (0..dim).step_by(2) {
-            let head_dim = i % head_size;
-            let freq = 1.0f32 / 10000.0f32.powf(head_dim as f32 / head_size as f32);
-            let val = pos as f32 * freq;
-            let fcr = val.cos();
-            let fci = val.sin();
-            let rotn = if i < kv_dim { 2 } else { 1 };
-            for v in 0..rotn {
-                let vec = if v == 0 { &mut s.q } else { &mut *k };
-                let v0 = vec[i];
-                let v1 = vec[i + 1];
-                vec[i] = v0 * fcr - v1 * fci;
-                vec[i + 1] = v0 * fci + v1 * fcr;
-            }
-        }
-
-        // multihead attention. iterate over all heads
-        for h in 0..p.n_heads {
-            // get the query vector for this head
-            let start = h * head_size;
-            let q = &s.q[start..start + head_size];
-
-            // attention scores for this head
-            let start = h * p.seq_len;
-            let att = &mut s.att[start..start + p.seq_len];
-
-            // iterate over all timesteps, including the current one
-            for t in 0..=pos {
-                // get the key vector for this head and at this timestep
-                let start = loff + t * kv_dim + (h / kv_mul) * head_size;
-                let k = &s.key_cache[start..start + head_size];
-
-                // calculate the attention score as the dot product of q and k
-                let mut score = 0.0f32;
-                for i in 0..head_size {
-                    score += q[i] * k[i];
-                }
-                score /= (head_size as f32).sqrt();
-                // save the score to the attention buffer
-                att[t] = score;
-            }
-
-            // softmax the scores to get attention weights, from 0..pos inclusively
-            softmax(&mut att[..pos + 1]);
-
-            // weighted sum of the values, store back into xb
-            let start = h * head_size;
-            let xb = &mut s.xb[start..start + head_size];
-            xb.fill(0.0);
-
-            for t in 0..=pos {
-                // get the value vector for this head and at this timestep
-                let start = loff + t * kv_dim + (h / kv_mul) * head_size;
-                let v = &s.value_cache[start..start + head_size];
-
-                // get the attention weight for this timestep
-                let a = att[t];
-                // accumulate the weighted value into xb
-                for i in 0..head_size {
-                    xb[i] += a * v[i];
-                }
-            }
-        }
-
-        // final matmul to get the output of the attention
-        let start = l * dim * dim;
-        matmul(
-            &mut s.xb2,
-            &s.xb,
-            &w.wo()[start..start + dim * dim],
-            dim,
-            dim,
-        );
-
-        // residual connection back into x
-        for i in 0..dim {
-            x[i] += s.xb2[i];
-        }
-
-        // ffn rmsnorm
-        let start = l * dim;
-        rmsnorm(&mut s.xb, &x, &w.rms_ffn_weight()[start..start + dim]);
-
-        // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
-        // first calculate self.w1(x) and self.w3(x)
-        let start = l * dim * hidden_dim;
-        let end = start + dim * hidden_dim;
-        matmul(&mut s.hb, &s.xb, &w.w1()[start..end], dim, hidden_dim);
-        matmul(&mut s.hb2, &s.xb, &w.w3()[start..end], dim, hidden_dim);
-
-        // SwiGLU non-linearity
-        for i in 0..hidden_dim {
-            let mut val = s.hb[i];
-            // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-            val *= 1.0 / (1.0 + (-val).exp());
-            // elementwise multiply with w3(x)
-            val *= s.hb2[i];
-            s.hb[i] = val;
-        }
-
-        // final matmul to get the output of the ffn
-        let start = l * dim * hidden_dim;
-        let end = start + hidden_dim * dim;
-        matmul(&mut s.xb, &s.hb, &w.w2()[start..end], hidden_dim, dim);
-
-        // residual connection
-        for i in 0..dim {
-            x[i] += s.xb[i];
-        }
-    }
-
-    // final rmsnorm
-    rmsnorm_inplace(x, &w.rms_final_weight()[..dim]);
-
-    // classifier into logits
-    matmul(&mut s.logits, x, w.wcls(), p.dim, p.vocab_size);
-
-    &mut s.logits
-}
-
 struct TokenIndex {
     str: Vec<u8>,
     id: usize,
@@ -484,50 +484,191 @@ struct Tokenizer {
     vocab_scores: Vec<f32>,
     sorted_vocab: Vec<TokenIndex>,
     vocab_size: usize,
-    max_token_length: usize,
+    _max_token_length: usize,
     byte_pieces: Vec<u8>,
 }
 
 impl Tokenizer {
-    fn new() -> Self {
-        Tokenizer {
-            vocab: vec![],
-            vocab_scores: vec![],
+    fn from_file(tokenizer_path: impl AsRef<Path>, vocab_size: usize) -> Self {
+        let mut byte_pieces = Vec::new();
+        for i in 0u8..=255 {
+            byte_pieces.push(i);
+        }
+
+        let mut file = match File::open(tokenizer_path) {
+            Ok(file) => file,
+            Err(e) => panic!("Error opening file: {}", e),
+        };
+
+        let mut bytes = [0u8; 4];
+        file.read_exact(&mut bytes).unwrap();
+        let max_token_length = i32::from_le_bytes(bytes) as usize;
+
+        let mut vocab_scores = Vec::new();
+        let mut vocab = Vec::new();
+        for _ in 0..vocab_size {
+            let mut bytes = [0u8; 4];
+            file.read_exact(&mut bytes).unwrap();
+            vocab_scores.push(f32::from_le_bytes(bytes));
+
+            let mut bytes = [0u8; 4];
+            file.read_exact(&mut bytes).unwrap();
+            let len = i32::from_le_bytes(bytes) as usize;
+
+            let mut bytes = vec![0u8; len];
+            file.read_exact(&mut bytes).unwrap();
+            vocab.push(bytes);
+        }
+
+        Self {
+            vocab,
+            vocab_scores,
             sorted_vocab: vec![],
-            vocab_size: 0,
-            max_token_length: 0,
-            byte_pieces: vec![],
+            vocab_size,
+            _max_token_length: max_token_length,
+            byte_pieces,
         }
     }
-}
 
-fn build_tokenizer(t: &mut Tokenizer, tokenizer_path: &str, vocab_size: usize) {
-    t.vocab_size = vocab_size;
-    for i in 0u8..=255 {
-        t.byte_pieces.push(i);
+    fn decode(&self, prev_token: usize, token: usize) -> &[u8] {
+        let mut piece: &[u8] = &self.vocab[token];
+        // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR #89)
+        if prev_token == 1 && piece[0] == b' ' {
+            piece = &piece[1..];
+        }
+        // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
+        // parse this and convert and return the actual byte
+        if let [b'<', b'0', b'x', hi, lo, b'>'] = piece {
+            if let (Some(hi), Some(lo)) = (hex_digit(*hi), hex_digit(*lo)) {
+                let byte = (hi << 4) | lo;
+                let start = usize::from(byte);
+                return &self.byte_pieces[start..start + 1];
+            }
+        }
+        piece
     }
 
-    let mut file = match File::open(tokenizer_path) {
-        Ok(file) => file,
-        Err(e) => panic!("Error opening file: {}", e),
-    };
+    fn encode(&mut self, text: &[u8], bos: bool, eos: bool, tokens: &mut Vec<usize>) {
+        if self.sorted_vocab.is_empty() {
+            for i in 0..self.vocab_size {
+                self.sorted_vocab.push(TokenIndex {
+                    id: i,
+                    str: self.vocab[i].clone(),
+                });
+            }
 
-    let mut bytes = [0u8; 4];
-    file.read_exact(&mut bytes).unwrap();
-    t.max_token_length = i32::from_le_bytes(bytes) as usize;
+            self.sorted_vocab.sort_by(|a, b| a.str.cmp(&b.str));
+        }
 
-    for _ in 0..vocab_size {
-        let mut bytes = [0u8; 4];
-        file.read_exact(&mut bytes).unwrap();
-        t.vocab_scores.push(f32::from_le_bytes(bytes));
+        let mut str_buffer: Vec<u8> = Vec::new();
 
-        let mut bytes = [0u8; 4];
-        file.read_exact(&mut bytes).unwrap();
-        let len = i32::from_le_bytes(bytes) as usize;
+        // add optional BOS (=1) token, if desired
+        if bos {
+            tokens.push(1);
+        }
 
-        let mut bytes = vec![0u8; len];
-        file.read_exact(&mut bytes).unwrap();
-        t.vocab.push(bytes);
+        // add_dummy_prefix is true by default
+        // so prepend a dummy prefix token to the input string, but only if text != ""
+        // TODO: pretty sure this isn't correct in the general case but I don't have the
+        // energy to read more of the sentencepiece code to figure out what it's doing
+        if text.first().is_some_and(|&b| b != 0) {
+            let dummy_prefix = self.str_lookup(b" ");
+            tokens.push(dummy_prefix.unwrap());
+        }
+
+        // Okay UTF-8 time. This will get messy. Here is the reference from Wikipedia:
+        // Code point ↔ UTF-8 conversion
+        // First code point	Last code point	Byte 1	Byte 2	Byte 3	Byte 4
+        // U+0000	U+007F	    0xxxxxxx
+        // U+0080	U+07FF	    110xxxxx	10xxxxxx
+        // U+0800	U+FFFF	    1110xxxx	10xxxxxx	10xxxxxx
+        // U+10000	U+10FFFF    11110xxx	10xxxxxx	10xxxxxx	10xxxxxx
+
+        // process the raw (UTF-8) byte sequence of the input string
+        for (i, &c) in text.iter().enumerate() {
+            if c == 0 {
+                break;
+            }
+
+            // reset buffer if the current byte is ASCII or a leading byte
+            // 0xC0 is 11000000, so (*c & 0xC0) keeps the first 2 bits and zeros the rest
+            // 0x80 is 10000000
+            // in UTF-8, all continuation bytes start with "10" in first two bits
+            // so in English this is: "if this byte is not a continuation byte"
+            if c & 0xc0 != 0x80 {
+                // this byte must be either a leading byte (11...) or an ASCII char (0x...)
+                // => reset our location, as we're starting a new UTF-8 codepoint
+                str_buffer.clear();
+            }
+
+            // append the current byte to the buffer
+            str_buffer.push(c);
+
+            // while the next character is a continuation byte, continue appending
+            // but if there are too many of them, just stop to avoid overruning str_buffer size.
+            if text.get(i + 1).is_some_and(|&next| (next & 0xC0) == 0x80) && str_buffer.len() < 4 {
+                continue;
+            }
+
+            let id = self.str_lookup(&str_buffer);
+
+            if let Some(id) = id {
+                // we found this codepoint in vocab, add it as a token
+                tokens.push(id);
+            } else {
+                // byte_fallback encoding: just encode each byte as a token
+                // +3 is here because the first 3 vocab elements are <unk>, <s>, </s>
+                // so the individual bytes only start at index 3
+                for &buf in &str_buffer {
+                    tokens.push(buf as usize + 3);
+                }
+            }
+            str_buffer.clear(); // protect against a sequence of stray UTF8 continuation bytes
+        }
+
+        // merge the best consecutive pair each iteration, according the scores in vocab_scores
+        loop {
+            let mut best_score = -1e10f32;
+            let mut best_id = 0;
+            let mut best_idx = tokens.len();
+
+            for i in 0..tokens.len().saturating_sub(1) {
+                // check if we can merge the pair (tokens[i], tokens[i+1])
+                str_buffer.clear();
+                str_buffer.extend_from_slice(&self.vocab[tokens[i]]);
+                str_buffer.extend_from_slice(&self.vocab[tokens[i + 1]]);
+                let id = self.str_lookup(&str_buffer);
+                if let Some(id) = id
+                    && self.vocab_scores[id] > best_score
+                {
+                    // this merge pair exists in vocab! record its score and position
+                    best_score = self.vocab_scores[id];
+                    best_id = id;
+                    best_idx = i;
+                }
+            }
+
+            if best_idx == tokens.len() {
+                break;
+            }
+
+            // merge the consecutive pair (best_idx, best_idx+1) into new token best_id
+            tokens[best_idx] = best_id;
+            // delete token at position best_idx+1, shift the entire sequence back 1
+            tokens.remove(best_idx + 1);
+        }
+
+        // add optional EOS (=2) token, if desired
+        if eos {
+            tokens.push(2);
+        }
+    }
+
+    fn str_lookup(&self, piece: &[u8]) -> Option<usize> {
+        self.sorted_vocab
+            .binary_search_by(|x| x.str.as_slice().cmp(piece))
+            .ok()
+            .map(|index| self.sorted_vocab[index].id)
     }
 }
 
@@ -538,24 +679,6 @@ fn hex_digit(c: u8) -> Option<u8> {
         b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
     }
-}
-
-fn decode(t: &Tokenizer, prev_token: usize, token: usize) -> &[u8] {
-    let mut piece: &[u8] = &t.vocab[token];
-    // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR #89)
-    if prev_token == 1 && piece[0] == b' ' {
-        piece = &piece[1..];
-    }
-    // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
-    // parse this and convert and return the actual byte
-    if let [b'<', b'0', b'x', hi, lo, b'>'] = piece {
-        if let (Some(hi), Some(lo)) = (hex_digit(*hi), hex_digit(*lo)) {
-            let byte = (hi << 4) | lo;
-            let start = usize::from(byte);
-            return &t.byte_pieces[start..start + 1];
-        }
-    }
-    piece
 }
 
 fn safe_print(piece: &[u8]) -> io::Result<()> {
@@ -576,129 +699,6 @@ fn safe_print(piece: &[u8]) -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     out.write_all(piece)
-}
-
-fn str_lookup(piece: &[u8], sorted_vocab: &[TokenIndex]) -> Option<usize> {
-    sorted_vocab
-        .binary_search_by(|x| x.str.as_slice().cmp(piece))
-        .ok()
-        .map(|index| sorted_vocab[index].id)
-}
-
-fn encode(t: &mut Tokenizer, text: &[u8], bos: bool, eos: bool, tokens: &mut Vec<usize>) {
-    if t.sorted_vocab.is_empty() {
-        for i in 0..t.vocab_size {
-            t.sorted_vocab.push(TokenIndex {
-                id: i,
-                str: t.vocab[i].clone(),
-            });
-        }
-
-        t.sorted_vocab.sort_by(|a, b| a.str.cmp(&b.str));
-    }
-
-    let mut str_buffer: Vec<u8> = Vec::new();
-
-    // add optional BOS (=1) token, if desired
-    if bos {
-        tokens.push(1);
-    }
-
-    // add_dummy_prefix is true by default
-    // so prepend a dummy prefix token to the input string, but only if text != ""
-    // TODO: pretty sure this isn't correct in the general case but I don't have the
-    // energy to read more of the sentencepiece code to figure out what it's doing
-    if text.first().is_some_and(|&b| b != 0) {
-        let dummy_prefix = str_lookup(b" ", &t.sorted_vocab);
-        tokens.push(dummy_prefix.unwrap());
-    }
-
-    // Okay UTF-8 time. This will get messy. Here is the reference from Wikipedia:
-    // Code point ↔ UTF-8 conversion
-    // First code point	Last code point	Byte 1	Byte 2	Byte 3	Byte 4
-    // U+0000	U+007F	    0xxxxxxx
-    // U+0080	U+07FF	    110xxxxx	10xxxxxx
-    // U+0800	U+FFFF	    1110xxxx	10xxxxxx	10xxxxxx
-    // U+10000	U+10FFFF    11110xxx	10xxxxxx	10xxxxxx	10xxxxxx
-
-    // process the raw (UTF-8) byte sequence of the input string
-    for (i, &c) in text.iter().enumerate() {
-        if c == 0 {
-            break;
-        }
-
-        // reset buffer if the current byte is ASCII or a leading byte
-        // 0xC0 is 11000000, so (*c & 0xC0) keeps the first 2 bits and zeros the rest
-        // 0x80 is 10000000
-        // in UTF-8, all continuation bytes start with "10" in first two bits
-        // so in English this is: "if this byte is not a continuation byte"
-        if c & 0xc0 != 0x80 {
-            // this byte must be either a leading byte (11...) or an ASCII char (0x...)
-            // => reset our location, as we're starting a new UTF-8 codepoint
-            str_buffer.clear();
-        }
-
-        // append the current byte to the buffer
-        str_buffer.push(c);
-
-        // while the next character is a continuation byte, continue appending
-        // but if there are too many of them, just stop to avoid overruning str_buffer size.
-        if text.get(i + 1).is_some_and(|&next| (next & 0xC0) == 0x80) && str_buffer.len() < 4 {
-            continue;
-        }
-
-        let id = str_lookup(&str_buffer, &t.sorted_vocab);
-
-        if let Some(id) = id {
-            // we found this codepoint in vocab, add it as a token
-            tokens.push(id);
-        } else {
-            // byte_fallback encoding: just encode each byte as a token
-            // +3 is here because the first 3 vocab elements are <unk>, <s>, </s>
-            // so the individual bytes only start at index 3
-            for &buf in &str_buffer {
-                tokens.push(buf as usize + 3);
-            }
-        }
-        str_buffer.clear(); // protect against a sequence of stray UTF8 continuation bytes
-    }
-
-    // merge the best consecutive pair each iteration, according the scores in vocab_scores
-    loop {
-        let mut best_score = -1e10f32;
-        let mut best_id = 0;
-        let mut best_idx = tokens.len();
-
-        for i in 0..tokens.len().saturating_sub(1) {
-            // check if we can merge the pair (tokens[i], tokens[i+1])
-            str_buffer.clear();
-            str_buffer.extend_from_slice(&t.vocab[tokens[i]]);
-            str_buffer.extend_from_slice(&t.vocab[tokens[i + 1]]);
-            let id = str_lookup(&str_buffer, &t.sorted_vocab);
-            if let Some(id) = id
-                && t.vocab_scores[id] > best_score
-            {
-                // this merge pair exists in vocab! record its score and position
-                best_score = t.vocab_scores[id];
-                best_id = id;
-                best_idx = i;
-            }
-        }
-
-        if best_idx == tokens.len() {
-            break;
-        }
-
-        // merge the consecutive pair (best_idx, best_idx+1) into new token best_id
-        tokens[best_idx] = best_id;
-        // delete token at position best_idx+1, shift the entire sequence back 1
-        tokens.remove(best_idx + 1);
-    }
-
-    // add optional EOS (=2) token, if desired
-    if eos {
-        tokens.push(2);
-    }
 }
 
 struct ProbIndex {
@@ -822,7 +822,7 @@ fn generate(
     steps: usize,
 ) {
     let mut prompt_tokens: Vec<usize> = vec![];
-    encode(&mut tokenizer, prompt, true, false, &mut prompt_tokens);
+    tokenizer.encode(prompt, true, false, &mut prompt_tokens);
 
     let num_prompt_tokens = prompt_tokens.len();
     if num_prompt_tokens < 1 {
@@ -835,7 +835,7 @@ fn generate(
     let mut pos = 0;
     while pos < steps {
         // forward the transformer to get logits for the next token
-        let logits: &mut [f32] = forward(&mut transformer, token, pos);
+        let logits: &mut [f32] = transformer.forward(token, pos);
 
         // advance the state machine
         if pos < num_prompt_tokens - 1 {
@@ -853,7 +853,7 @@ fn generate(
         }
 
         // print the token as string, decode it with the Tokenizer object
-        let piece = decode(&tokenizer, token, next);
+        let piece = tokenizer.decode(token, next);
         safe_print(piece).expect("Failed to flush stdout!");
         token = next;
     }
@@ -894,8 +894,7 @@ fn main() {
 
     // tokenizer
     let tokenizer_path = "tokenizer.bin";
-    let mut tokenizer = Tokenizer::new();
-    build_tokenizer(&mut tokenizer, tokenizer_path, vocab_size);
+    let tokenizer = Tokenizer::from_file(tokenizer_path, vocab_size);
 
     // sampler
     let sampler = Sampler::new(vocab_size, 1.0, 0.9);
