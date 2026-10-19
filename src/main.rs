@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::ops::Range;
 use std::path::Path;
+use std::process::exit;
 use std::{fs, io};
 
 struct Config {
@@ -19,7 +20,7 @@ struct Config {
 }
 
 impl Config {
-    fn try_from(bytes: &[u8]) -> Result<Self, std::io::Error> {
+    fn from_bytes(bytes: &[u8]) -> Result<Self, std::io::Error> {
         let vocab_size = i32::from_le_bytes(bytes[20..24].try_into().unwrap());
         let shared_weights = vocab_size > 0;
         Ok(Self {
@@ -64,18 +65,16 @@ struct TransformerWeights {
 }
 
 impl TransformerWeights {
-    fn try_from(data: Vec<f32>, config: &Config) -> Result<Self, std::io::Error> {
-        let dim = config.dim;
-        let hidden_dim = config.hidden_dim;
-        let n_layers = config.n_layers;
-        let n_heads = config.n_heads;
-        let n_kv_heads = config.n_kv_heads;
-        let seq_len = config.seq_len;
-        let vocab_size = config.vocab_size;
-        let head_size = dim / n_heads;
+    fn from_bytes(bytes: &[u8], config: &Config) -> Result<Self, std::io::Error> {
+        let data: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
 
-        let mut start: usize = 7; // Config size, 7 i32
-        let mut end: usize = start + (vocab_size * dim);
+        let head_size = config.dim / config.n_heads;
+
+        let mut start: usize = 0;
+        let mut end: usize = start + (config.vocab_size * config.dim);
 
         let shared_start = start;
         let shared_end = end;
@@ -83,44 +82,46 @@ impl TransformerWeights {
         let token_embedding_table = start..end;
 
         start = end;
-        end += n_layers * dim;
+        end += config.n_layers * config.dim;
         let rms_att_weight = start..end;
 
         start = end;
-        end += n_layers * dim * (n_heads * head_size);
+        end += config.n_layers * config.dim * (config.n_heads * head_size);
         let wq = start..end;
 
         start = end;
-        end += n_layers * dim * (n_kv_heads * head_size);
+        end += config.n_layers * config.dim * (config.n_kv_heads * head_size);
         let wk = start..end;
 
         start = end;
-        end += n_layers * dim * (n_kv_heads * head_size);
+        end += config.n_layers * config.dim * (config.n_kv_heads * head_size);
         let wv = start..end;
 
         start = end;
-        end += n_layers * (n_heads * head_size) * dim;
+        end += config.n_layers * (config.n_heads * head_size) * config.dim;
         let wo = start..end;
 
         start = end;
-        end += n_layers * dim;
+        end += config.n_layers * config.dim;
         let rms_ffn_weight = start..end;
 
         start = end;
-        end += n_layers * dim * hidden_dim;
+        end += config.n_layers * config.dim * config.hidden_dim;
         let w1 = start..end;
 
         start = end;
-        end += n_layers * hidden_dim * dim;
+        end += config.n_layers * config.hidden_dim * config.dim;
         let w2 = start..end;
 
         start = end;
-        end += n_layers * dim * hidden_dim;
+        end += config.n_layers * config.dim * config.hidden_dim;
         let w3 = start..end;
 
         start = end;
-        end += dim + seq_len * head_size;
+        end += config.dim;
         let rms_final_weight = start..end;
+
+        end += config.seq_len * head_size;
 
         let wcls = if config.shared_weights {
             shared_start..shared_end
@@ -211,22 +212,19 @@ struct RunState {
 }
 
 impl RunState {
-    fn new(
-        dim: usize,
-        hidden_dim: usize,
-        att_size: usize,
-        vocab_size: usize,
-        kv_size: usize,
-    ) -> Self {
+    fn new(c: &Config) -> Self {
+        let kv_dim = (c.dim * c.n_kv_heads) / c.n_heads;
+        let att_size = c.n_heads * c.seq_len;
+        let kv_size = c.n_layers * c.seq_len * kv_dim;
         Self {
-            x: vec![0.0; dim],
-            xb: vec![0.0; dim],
-            xb2: vec![0.0; dim],
-            hb: vec![0.0; hidden_dim],
-            hb2: vec![0.0; hidden_dim],
-            q: vec![0.0; dim],
+            x: vec![0.0; c.dim],
+            xb: vec![0.0; c.dim],
+            xb2: vec![0.0; c.dim],
+            hb: vec![0.0; c.hidden_dim],
+            hb2: vec![0.0; c.hidden_dim],
+            q: vec![0.0; c.dim],
             att: vec![0.0; att_size],
-            logits: vec![0.0; vocab_size],
+            logits: vec![0.0; c.vocab_size],
             key_cache: vec![0.0; kv_size],
             value_cache: vec![0.0; kv_size],
         }
@@ -240,12 +238,25 @@ struct Transformer {
 }
 
 impl Transformer {
-    fn new(config: Config, weights: TransformerWeights, state: RunState) -> Self {
+    fn from_file(model_path: impl AsRef<Path>) -> Self {
+        let bytes = fs::read(model_path).unwrap();
+
+        let (header_bytes, weight_bytes) = bytes.split_at(28);
+
+        let config = Config::from_bytes(&header_bytes).unwrap();
+        let weights = TransformerWeights::from_bytes(weight_bytes, &config).unwrap();
+
+        let state = RunState::new(&config);
+
         Self {
             config,
             weights,
             state,
         }
+    }
+
+    fn get_vocab_size(&self) -> usize {
+        self.config.vocab_size
     }
 
     fn forward(&mut self, token: usize, pos: usize) -> &mut [f32] {
@@ -861,45 +872,36 @@ fn generate(
 }
 
 fn main() {
-    let path = Path::new("stories15M.bin");
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(e) => panic!("Error opening file: {}", e),
-    };
-
-    let mut bytes = [0u8; 28];
-    file.read_exact(&mut bytes).unwrap();
-
-    let config = Config::try_from(&bytes).unwrap();
-    let vocab_size = config.vocab_size;
-
-    let data: Vec<u8> = fs::read(path).unwrap();
-    let data: Vec<f32> = data
-        .chunks(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-        .collect();
-
-    let weights = TransformerWeights::try_from(data, &config).unwrap();
-
-    let kv_dim = (config.dim * config.n_kv_heads) / config.n_heads;
-    let state = RunState::new(
-        config.dim,
-        config.hidden_dim,
-        config.n_heads * config.seq_len,
-        vocab_size,
-        config.n_layers * config.seq_len * kv_dim,
-    );
-
-    let transformer = Transformer::new(config, weights, state);
+    // transformer
+    let model_path = Path::new("stories15M.bin");
+    let transformer = Transformer::from_file(model_path);
 
     // tokenizer
     let tokenizer_path = "tokenizer.bin";
-    let tokenizer = Tokenizer::from_file(tokenizer_path, vocab_size);
+    let tokenizer = Tokenizer::from_file(tokenizer_path, transformer.get_vocab_size());
 
     // sampler
-    let sampler = Sampler::new(vocab_size, 1.0, 0.9);
+    let sampler = Sampler::new(transformer.get_vocab_size(), 1.0, 0.9);
+
+    // input
+    let mut args = std::env::args().skip(1);
+    let mut prompt = String::from("There was");
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-i" => {
+                prompt = args.next().unwrap_or_else(|| {
+                    eprintln!("Usage: -i \"prompt\"");
+                    exit(1);
+                });
+            }
+            _ => {
+                eprintln!("Can not parse input arguments.");
+                exit(1);
+            }
+        }
+    }
 
     // run!
-    let prompt = String::from("Hello World! ");
     generate(transformer, tokenizer, sampler, prompt.as_bytes(), 256);
 }
