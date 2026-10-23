@@ -8,6 +8,10 @@ use std::path::Path;
 use std::process::exit;
 use std::{fs, io};
 
+use crate::gpu::GpuTransformer;
+
+mod gpu;
+
 struct Config {
     dim: usize,        // transformer dimension
     hidden_dim: usize, // for ffn layers
@@ -47,9 +51,9 @@ struct TransformerWeights {
     rms_ffn_weight: Range<usize>, // (layer, dim)
 
     // weights for matmuls. note dim == n_heads * head_size
-    wq: Range<usize>, // (layer, dim, n_heads * head_size)
-    wk: Range<usize>, // (layer, dim, n_kv_heads * head_size)
-    wv: Range<usize>, // (layer, dim, n_kv_heads * head_size)
+    wq: Range<usize>, // (layer, n_heads * head_size, dim)
+    wk: Range<usize>, // (layer, n_kv_heads * head_size, dim)
+    wv: Range<usize>, // (layer, n_kv_heads * head_size, dim)
     wo: Range<usize>, // (layer, n_heads * head_size, dim)
 
     // weights for ffn
@@ -872,36 +876,39 @@ fn generate(
 }
 
 fn main() {
-    // transformer
+    // // transformer
+    // let model_path = Path::new("stories15M.bin");
+    // let transformer = Transformer::from_file(model_path);
+
+    // // tokenizer
+    // let tokenizer_path = "tokenizer.bin";
+    // let tokenizer = Tokenizer::from_file(tokenizer_path, transformer.get_vocab_size());
+
+    // // sampler
+    // let sampler = Sampler::new(transformer.get_vocab_size(), 1.0, 0.9);
+
+    // // input
+    // let mut args = std::env::args().skip(1);
+    // let mut prompt = String::from("There was");
+
+    // while let Some(arg) = args.next() {
+    //     match arg.as_str() {
+    //         "-i" => {
+    //             prompt = args.next().unwrap_or_else(|| {
+    //                 eprintln!("Usage: -i \"prompt\"");
+    //                 exit(1);
+    //             });
+    //         }
+    //         _ => {
+    //             eprintln!("Can not parse input arguments.");
+    //             exit(1);
+    //         }
+    //     }
+    // }
+
+    // // run!
+    // generate(transformer, tokenizer, sampler, prompt.as_bytes(), 256);
+
     let model_path = Path::new("stories15M.bin");
-    let transformer = Transformer::from_file(model_path);
-
-    // tokenizer
-    let tokenizer_path = "tokenizer.bin";
-    let tokenizer = Tokenizer::from_file(tokenizer_path, transformer.get_vocab_size());
-
-    // sampler
-    let sampler = Sampler::new(transformer.get_vocab_size(), 1.0, 0.9);
-
-    // input
-    let mut args = std::env::args().skip(1);
-    let mut prompt = String::from("There was");
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-i" => {
-                prompt = args.next().unwrap_or_else(|| {
-                    eprintln!("Usage: -i \"prompt\"");
-                    exit(1);
-                });
-            }
-            _ => {
-                eprintln!("Can not parse input arguments.");
-                exit(1);
-            }
-        }
-    }
-
-    // run!
-    generate(transformer, tokenizer, sampler, prompt.as_bytes(), 256);
+    let transformer = GpuTransformer::from_file(model_path);
 }
