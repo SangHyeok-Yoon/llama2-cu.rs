@@ -9,105 +9,108 @@ mod kernel {
     use cutile::core::{reduce_sum, *};
 
     #[cutile::entry()]
-    fn softmax<const BM: i32>(y: &mut Tensor<f32, { [BM] }>, x: &Tensor<f32, { [-1] }>) {
-        let tile_x = x.load_like(y);
-
-        let tile_x_max: Tile<f32, { [1] }> = reduce_max(tile_x, 0);
-        let tile_x_max = tile_x_max.broadcast(y.shape());
-
-        let num = exp(tile_x - tile_x_max);
-
-        let denom: Tile<f32, { [1] }> = reduce_sum(num, 0);
-        let denom = denom.broadcast(y.shape());
-
-        y.store(num / denom);
-    }
-
-    #[cutile::entry()]
     fn rmsnorm<const BM: i32>(
         y: &mut Tensor<f32, { [BM] }>,
-        x: &Tensor<f32, { [-1] }>,
-        w: &Tensor<f32, { [-1] }>,
-    ) {
-        let tile_x = x.load_like(y);
-        let tile_w = w.load_like(y);
-
-        let len = constant(x.shape()[0] as f32, shape![1]);
-        let ep = constant(1e-5 as f32, shape![1]);
-        let one = constant(1.0f32, shape![1]);
-
-        let tile_x_sum: Tile<f32, { [1] }> = reduce_sum(tile_x * tile_x, 0);
-        let tile_x_sum = tile_x_sum / len + ep;
-
-        let ss = one / sqrt(tile_x_sum, rounding::Zero, ftz::Disabled);
-        let ss = ss.broadcast(shape![BM]);
-
-        y.store(tile_w * ss * tile_x);
-    }
-
-    #[cutile::entry()]
-    fn matmul_1d<const BM: i32, const DIM: i32>(
-        y: &mut Tensor<f32, { [BM] }>,
-        w: &Tensor<f32, { [-1, -1, -1] }>,
-        x: &Tensor<f32, { [-1] }>,
+        x: &Tensor<f32, { [-1] }>,     // dim
+        w: &Tensor<f32, { [-1, -1] }>, // layer, dim
         l: i32,
     ) {
-        let w_part = w.partition(shape![1, BM, DIM]);
-        let tw = w_part.load([l, 0, 0]);
-        let tw = tw.reshape(shape![BM, DIM]);
+        let dim = x.shape()[0];
+        let num_tile = ceil_div(dim, BM);
 
-        let x_part = x.partition(shape![DIM]);
-        let tx = x_part.load([0]);
-        let tx = tx.reshape(shape![DIM, 1]);
+        let x_part = x.partition(shape![BM]);
 
-        let out = constant(0.0f32, shape![BM, 1]);
-        let out = mma(tw, tx, out);
-        let out = out.reshape(shape![BM]);
-
-        y.store(out);
-    }
-
-    #[cutile::entry()]
-    fn matmul<const SEQ_LEN: i32, const BM: i32, const DIM: i32>(
-        y: &mut Tensor<f32, { [1, 1, BM] }>,
-        w: &Tensor<f32, { [-1, -1, -1] }>,
-        x: &Tensor<f32, { [-1] }>,
-        l: i32,
-        pos: i32,
-    ) {
-        if l != program_id(0) || pos != program_id(1) {
-            return;
+        let mut x_sum: Tile<f32, { [1] }> = constant(0.0f32, shape![1]);
+        for t in 0..num_tile {
+            let tx = x_part.load([t]);
+            let tx_sum: Tile<f32, { [1] }> = reduce_sum(tx * tx, 0);
+            x_sum = x_sum + tx_sum.reshape(shape![1]);
         }
 
-        let w_part = w.partition(shape![1, BM, DIM]);
-        let tw = w_part.load([l, 0, 0]);
-        let tw = tw.reshape(shape![BM, DIM]);
+        let len = broadcast_scalar(convert_scalar::<f32>(dim), shape![1]);
+        let eps = constant(1e-5f32, shape![1]);
+        let one = constant(1.0f32, shape![1]);
 
-        let x_part = x.partition(shape![DIM]);
-        let tx = x_part.load([0]);
-        let tx = tx.reshape(shape![DIM, 1]);
+        x_sum = x_sum / len + eps;
 
-        let out = constant(0.0f32, shape![BM, 1]);
-        let out = mma(tw, tx, out);
-        let out = out.reshape(shape![1, 1, BM]);
+        let ss = one / sqrt(x_sum, rounding::Zero, ftz::Disabled);
+        let ss = ss.broadcast(shape![BM]);
 
-        y.store(out);
+        let tx = x.load_like(y);
+        let w_part = w.partition(shape![1, BM]);
+        let tw = w_part.load([l, program_id(0)]).reshape(shape![BM]);
+
+        y.store(tw * ss * tx);
     }
 
     #[cutile::entry()]
-    fn rope_q<const HEAD_SIZE: i32, const HALF_DIM: i32>(
-        q: &mut Tensor<f32, { [HEAD_SIZE] }>,
+    fn matmul_q<const BM: i32>(
+        y: &mut Tensor<f32, { [BM] }>,
+        w: &Tensor<f32, { [-1, -1, -1] }>, // l, dim, dim
+        x: &Tensor<f32, { [-1] }>,         // dim
+        l: i32,
+    ) {
+        let pid0 = program_id(0);
+        let dim = w.shape()[1];
+        let num_tile = ceil_div(dim, BM);
+
+        let w_part = w.partition(shape![1, BM, BM]);
+        let x_part = x.partition(shape![BM]);
+
+        let mut ty = load_tile_mut(y).reshape(shape![BM, 1]);
+
+        for t in 0..num_tile {
+            let tw = w_part.load([l, pid0, t]).reshape(shape![BM, BM]);
+            let tx = x_part.load([t]).reshape(shape![BM, 1]);
+            ty = mma(tw, tx, ty);
+        }
+
+        y.store(ty.reshape(shape![BM]));
+    }
+
+    #[cutile::entry()]
+    fn matmul_kv<const BM: i32>(
+        y: &mut Tensor<f32, { [1, 1, BM] }>, // l, seq_len, kv_dim
+        w: &Tensor<f32, { [-1, -1, -1] }>,   // l, kv_dim, dim
+        x: &Tensor<f32, { [-1] }>,           // dim
+        l: i32,
         pos: i32,
     ) {
-        let head_dim: Tile<f32, { [HALF_DIM] }> = iota(shape![HALF_DIM]);
+        if l == program_id(0) && pos == program_id(1) {
+            let pid2 = program_id(2);
+            let dim = w.shape()[2];
+            let num_tile = ceil_div(dim, BM);
+
+            let w_part = w.partition(shape![1, BM, BM]);
+            let x_part = x.partition(shape![BM]);
+
+            let mut ty = load_tile_mut(y).reshape(shape![BM, 1]);
+
+            for t in 0..num_tile {
+                let tw = w_part.load([l, pid2, t]).reshape(shape![BM, BM]);
+                let tx = x_part.load([t]).reshape(shape![BM, 1]);
+                ty = mma(tw, tx, ty);
+            }
+
+            y.store(ty.reshape(shape![1, 1, BM]));
+        }
+    }
+
+    #[cutile::entry()]
+    fn rope_q<const HEAD_TILE: i32, const HEAD_SIZE: i32, const HALF_DIM: i32>(
+        q: &mut Tensor<f32, { [1, HEAD_TILE] }>,
+        pos: i32,
+    ) {
+        let head_dim: Tile<i32, { [HALF_DIM] }> = iota(shape![HALF_DIM]);
+        let head_dim: Tile<f32, { [HALF_DIM] }> = convert_tile(head_dim);
         let head_dim = head_dim * constant(2.0f32, shape![HALF_DIM]); // step by 2
-        let head_size = constant(HEAD_SIZE as f32, shape![HALF_DIM]);
+        let head_size = broadcast_scalar(convert_scalar::<f32>(HEAD_SIZE), shape![HALF_DIM]);
         let exponent = head_dim / head_size;
 
         let base = constant(10000.0f32, shape![HALF_DIM]);
         let freq = constant(1.0f32, shape![HALF_DIM]) / pow(base, exponent);
 
-        let val = constant(pos as f32, shape![HALF_DIM]) * freq;
+        let val = broadcast_scalar(convert_scalar::<f32>(pos), shape![HALF_DIM]) * freq;
         let fcr = cos(val).reshape(shape![HALF_DIM, 1]);
         let fci = sin(val).reshape(shape![HALF_DIM, 1]);
 
@@ -125,118 +128,118 @@ mod kernel {
         let r1 = v0 * fci + v1 * fcr;
 
         let rotated: Tile<f32, { [HALF_DIM, 2] }> = cat(r0, r1, 1);
-        q.store(rotated.reshape(shape![HEAD_SIZE]));
+        q.store(rotated.reshape(shape![1, HEAD_TILE]));
     }
 
     #[cutile::entry()]
-    fn rope_k<const HEAD_SIZE: i32, const HALF_DIM: i32>(
-        k: &mut Tensor<f32, { [1, 1, HEAD_SIZE] }>,
-        l: i32,
+    fn rope_k<const HEAD_TILE: i32, const HEAD_SIZE: i32, const HALF_DIM: i32>(
+        k: &mut Tensor<f32, { [1, 1, HEAD_TILE] }>, // n_layers * seq_len, n_kv_heads, head_size
+        row: i32,
         pos: i32,
     ) {
-        if l != program_id(0) || pos != program_id(1) {
-            return;
+        if row == program_id(0) {
+            let head_dim: Tile<i32, { [HALF_DIM] }> = iota(shape![HALF_DIM]);
+            let head_dim: Tile<f32, { [HALF_DIM] }> = convert_tile(head_dim);
+            let head_dim = head_dim * constant(2.0f32, shape![HALF_DIM]); // step by 2
+            let head_size = broadcast_scalar(convert_scalar::<f32>(HEAD_SIZE), shape![HALF_DIM]);
+            let exponent = head_dim / head_size;
+
+            let base = constant(10000.0f32, shape![HALF_DIM]);
+            let freq = constant(1.0f32, shape![HALF_DIM]) / pow(base, exponent);
+
+            let val = broadcast_scalar(convert_scalar::<f32>(pos), shape![HALF_DIM]) * freq;
+            let fcr = cos(val).reshape(shape![HALF_DIM, 1]);
+            let fci = sin(val).reshape(shape![HALF_DIM, 1]);
+
+            let pairs = k.load();
+            let pairs = pairs.reshape(shape![HALF_DIM, 2]);
+
+            let zero = constant(0i32, shape![]);
+            let one = constant(1i32, shape![]);
+
+            let v0: Tile<f32, { [HALF_DIM, 1] }> = extract(pairs, [zero, zero]);
+            let v1: Tile<f32, { [HALF_DIM, 1] }> = extract(pairs, [zero, one]);
+
+            let r0 = v0 * fcr - v1 * fci;
+            let r1 = v0 * fci + v1 * fcr;
+
+            let rotated: Tile<f32, { [HALF_DIM, 2] }> = cat(r0, r1, 1);
+            k.store(rotated.reshape(shape![1, 1, HEAD_TILE]));
         }
-
-        let head_dim: Tile<f32, { [HALF_DIM] }> = iota(shape![HALF_DIM]);
-        let head_dim = head_dim * constant(2.0f32, shape![HALF_DIM]); // step by 2
-        let head_size = constant(HEAD_SIZE as f32, shape![HALF_DIM]);
-        let exponent = head_dim / head_size;
-
-        let base = constant(10000.0f32, shape![HALF_DIM]);
-        let freq = constant(1.0f32, shape![HALF_DIM]) / pow(base, exponent);
-
-        let val = constant(pos as f32, shape![HALF_DIM]) * freq;
-        let fcr = cos(val).reshape(shape![HALF_DIM, 1]);
-        let fci = sin(val).reshape(shape![HALF_DIM, 1]);
-
-        let pairs = k.load();
-        let pairs = pairs.reshape(shape![HEAD_SIZE]);
-        let pairs = pairs.reshape(shape![HALF_DIM, 2]);
-
-        let zero = constant(0i32, shape![]);
-        let one = constant(1i32, shape![]);
-
-        let v0: Tile<f32, { [HALF_DIM, 1] }> = extract(pairs, [zero, zero]);
-        let v1: Tile<f32, { [HALF_DIM, 1] }> = extract(pairs, [zero, one]);
-
-        let r0 = v0 * fcr - v1 * fci;
-        let r1 = v0 * fci + v1 * fcr;
-
-        let rotated: Tile<f32, { [HALF_DIM, 2] }> = cat(r0, r1, 1);
-        k.store(rotated.reshape(shape![1, 1, HEAD_SIZE]));
     }
 
     #[cutile::entry()]
-    fn mha<const HEAD_SIZE: i32, const BM: i32>(
-        out: &mut Tensor<f32, { [1, HEAD_SIZE] }>,
-        q: &Tensor<f32, { [-1, -1] }>,         // n_heads, head_size
-        k: &Tensor<f32, { [-1, -1, -1, -1] }>, // n_layer, seq_len, n_kv_heads, head_size
-        v: &Tensor<f32, { [-1, -1, -1, -1] }>, // n_layer, seq_len, n_kv_heads, head_size
+    fn mha<const HEAD_TILE: i32, const BM: i32>(
+        out: &mut Tensor<f32, { [1, HEAD_TILE] }>, // n_heads, head_size
+        q: &Tensor<f32, { [-1, -1] }>,             // n_heads, head_size
+        k: &Tensor<f32, { [-1, -1, -1, -1] }>,     // n_layer, seq_len, n_kv_heads, head_size
+        v: &Tensor<f32, { [-1, -1, -1, -1] }>,     // n_layer, seq_len, n_kv_heads, head_size
         l: i32,
         pos: i32,
         kv_mul: i32,
         qk_scale: f32,
     ) {
-        let pid0 = program_id(0);
+        let h_idx = program_id(0);
 
         let two = constant(2.0f32, shape![]);
         let log2: f32 = tile_to_scalar(log(two));
         let qk_scale: f32 = qk_scale / log2;
         let qk_scale = qk_scale.broadcast(shape![BM]);
 
-        let tq = q.partition(shape![1, HEAD_SIZE]);
-        let tq = tq.load([pid0, 0]);
+        let tq = q.partition(shape![1, HEAD_TILE]);
+        let tq = tq.load([h_idx, 0]);
 
-        let k_part = k.partition_permuted(shape![1, 1, BM, HEAD_SIZE], const_array![0, 2, 1, 3]);
-        let v_part = v.partition_permuted(shape![1, 1, BM, HEAD_SIZE], const_array![0, 2, 1, 3]);
+        let k_part = k.partition_permuted(shape![1, 1, BM, HEAD_TILE], const_array![0, 2, 1, 3]);
+        let v_part = v.partition_permuted(shape![1, 1, BM, HEAD_TILE], const_array![0, 2, 1, 3]);
 
         let mut m_i = constant(f32::NEG_INFINITY, shape![1]); // running max
         let mut l_i = constant(0.0f32, shape![1]); // rescale factor
-        let mut acc = constant(0.0f32, shape![1, HEAD_SIZE]); // accumulation
+        let mut acc = constant(0.0f32, shape![1, HEAD_TILE]); // accumulation
 
         let num_tiles = ceil_div(pos + 1, BM);
 
         for j in 0..num_tiles {
-            let kv_h_i = pid0 / kv_mul;
+            let kv_h_i = h_idx / kv_mul;
             let tk = k_part
                 .load([l, kv_h_i, j, 0])
-                .reshape(shape![BM, HEAD_SIZE]);
+                .reshape(shape![BM, HEAD_TILE]);
             let tk_transpose = tk.transpose();
             let qk = constant(0.0f32, shape![1, BM]);
             let qk = mma(tq, tk_transpose, qk).reshape(shape![BM]);
             let qk = qk * qk_scale;
 
             // casual masking
-            let offsets = iota(shape![BM]);
+            let offsets: Tile<i32, { [BM] }> = iota(shape![BM]);
             let token_idx = offsets + broadcast_scalar(j * BM, shape![BM]);
 
             let valid = lt_tile(token_idx, broadcast_scalar(pos + 1, shape![BM]));
 
-            let neg_inf = constant(f32::NEG_INFINITY, shape![BM]);
+            let neg_inf: Tile<f32, { [BM] }> = constant(f32::NEG_INFINITY, shape![BM]);
             let qk = select(valid, qk, neg_inf);
 
             // update running max
             let qk_max: Tile<f32, { [1] }> = reduce_max(qk, 0);
+            let qk_max = qk_max.reshape(shape![1]);
             let m_ij = max_tile(m_i, qk_max);
             let qk = qk - m_ij.broadcast(shape![BM]);
 
             // Softmax numerator and correction factor
             let p = exp2(qk, ftz::Disabled);
             let l_ij: Tile<f32, { [1] }> = reduce_sum(p, 0);
+            let l_ij = l_ij.reshape(shape![1]);
             let alpha = exp2(m_i - m_ij, ftz::Disabled);
 
             // update running sum and rescale accumulator
             l_i = l_i * alpha + l_ij;
             let alpha = alpha
-                .broadcast(shape![HEAD_SIZE])
-                .reshape(shape![1, HEAD_SIZE]);
+                .broadcast(shape![HEAD_TILE])
+                .reshape(shape![1, HEAD_TILE]);
             acc = acc * alpha;
 
             // Accumulate P @ V
             let tv = v_part
                 .load([l, kv_h_i, j, 0])
-                .reshape(shape![BM, HEAD_SIZE]);
+                .reshape(shape![BM, HEAD_TILE]);
             let p = p.reshape(shape![1, BM]);
             acc = mma(p, tv, acc);
             m_i = m_ij;
@@ -245,68 +248,145 @@ mod kernel {
         // Final normalization
         acc = true_div(
             acc,
-            l_i.broadcast(shape![HEAD_SIZE])
-                .reshape(shape![1, HEAD_SIZE]),
+            l_i.broadcast(shape![HEAD_TILE])
+                .reshape(shape![1, HEAD_TILE]),
         );
         out.store(acc);
     }
 
     #[cutile::entry()]
-    fn fmatmul<const DIM: i32>(
-        out: &mut Tensor<f32, { [DIM] }>,
-        x: &Tensor<f32, { [-1] }>,          // dim
-        wo: &Tensor<f32, { [-1, -1, -1] }>, // n_layer, dim, dim
+    fn fmatmul<const BM: i32>(
+        y: &mut Tensor<f32, { [BM] }>,
+        w: &Tensor<f32, { [-1, -1, -1] }>, // n_layer, dim, dim
+        x: &Tensor<f32, { [-1] }>,         // dim
         l: i32,
     ) {
-        let tx = x.load_like(out).reshape(shape![1, DIM]);
+        let pid0 = program_id(0);
+        let dim = w.shape()[1];
+        let num_tile = ceil_div(dim, BM);
 
-        let tw = wo.partition(shape![1, DIM, DIM]);
-        let tw = tw.load([l, 0, 0]).reshape(shape![DIM, DIM]);
+        let w_part = w.partition(shape![1, BM, BM]);
+        let x_part = x.partition(shape![BM]);
 
-        let mut y = constant(0.0f32, shape![1, DIM]);
-        y = mma(tx, tw, y);
+        let mut acc = constant(0.0f32, shape![BM, 1]);
 
-        let residual = out.load();
-        out.store(residual + y.reshape(shape![DIM]));
+        for t in 0..num_tile {
+            let tw = w_part.load([l, pid0, t]).reshape(shape![BM, BM]);
+            let tx = x_part.load([t]).reshape(shape![BM, 1]);
+            acc = mma(tw, tx, acc);
+        }
+
+        let residual = y.load();
+        y.store(residual + acc.reshape(shape![BM]));
     }
 
     #[cutile::entry()]
-    fn fffn<const DIM: i32, const HIDDEN_DIM: i32>(
-        out: &mut Tensor<f32, { [DIM] }>,
-        x: &Tensor<f32, { [-1] }>,          // dim
+    fn matmul_silu<const BM: i32, const BK: i32>(
+        y: &mut Tensor<f32, { [BM] }>,      // hidden_dim
         w1: &Tensor<f32, { [-1, -1, -1] }>, // layer, hidden_dim, dim
-        w2: &Tensor<f32, { [-1, -1, -1] }>, // layer, dim, hidden_dim
         w3: &Tensor<f32, { [-1, -1, -1] }>, // layer, hidden_dim, dim
+        x: &Tensor<f32, { [-1] }>,          // dim
         l: i32,
     ) {
-        let tx = x.load_like(out).reshape(shape![DIM, 1]);
+        let idx = program_id(0);
+        let dim = x.shape()[0];
 
-        let tw1 = w1.partition(shape![1, HIDDEN_DIM, DIM]);
-        let tw1 = tw1.load([l, 0, 0]).reshape(shape![HIDDEN_DIM, DIM]);
+        let w1_part = w1.partition(shape![1, BM, BK]);
+        let w3_part = w3.partition(shape![1, BM, BK]);
+        let x_part = x.partition(shape![BK]);
 
-        let tw2 = w2.partition(shape![1, DIM, HIDDEN_DIM]);
-        let tw2 = tw2.load([l, 0, 0]).reshape(shape![DIM, HIDDEN_DIM]);
+        let mut w1x = constant(0.0f32, shape![BM, 1]);
+        let mut w3x = constant(0.0f32, shape![BM, 1]);
 
-        let tw3 = w3.partition(shape![1, HIDDEN_DIM, DIM]);
-        let tw3 = tw3.load([l, 0, 0]).reshape(shape![HIDDEN_DIM, DIM]);
+        let num_tile = ceil_div(dim, BK);
 
-        // matmul
-        let w1x = constant(0.0f32, shape![HIDDEN_DIM, 1]);
-        let w1x = mma(tw1, tx, w1x);
+        for t in 0..num_tile {
+            let tw1 = w1_part.load([l, idx, t]).reshape(shape![BM, BK]);
+            let tw3 = w3_part.load([l, idx, t]).reshape(shape![BM, BK]);
+            let tx = x_part.load([t]).reshape(shape![BK, 1]);
 
-        let w3x = constant(0.0f32, shape![HIDDEN_DIM, 1]);
-        let w3x = mma(tw3, tx, w3x);
+            w1x = mma(tw1, tx, w1x);
+            w3x = mma(tw3, tx, w3x);
+        }
 
-        // SwiGLU non-linearity
         let one = constant(1.0f32, w1x.shape());
         let w1x = (w1x / (one + exp(negf(w1x)))) * w3x;
 
-        let y = constant(0.0f32, shape![DIM, 1]);
-        let y = mma(tw2, w1x, y);
-        let y = y.reshape(shape![DIM]);
+        y.store(w1x.reshape(shape![BM]));
+    }
 
-        let input = out.load();
-        out.store(input + y);
+    #[cutile::entry()]
+    fn matmul_ffn<const BM: i32, const BK: i32>(
+        y: &mut Tensor<f32, { [BM] }>,      // dim
+        w2: &Tensor<f32, { [-1, -1, -1] }>, // layer, dim, hidden_dim
+        x: &Tensor<f32, { [-1] }>,          // hidden_dim
+        l: i32,
+    ) {
+        let idx = program_id(0);
+        let hidden_dim = x.shape()[0];
+
+        let w2_part = w2.partition(shape![1, BM, BK]);
+        let x_part = x.partition(shape![BK]);
+
+        let mut acc = constant(0.0f32, shape![BM, 1]);
+
+        let num_tile = ceil_div(hidden_dim, BK);
+
+        for t in 0..num_tile {
+            let tw2 = w2_part.load([l, idx, t]).reshape(shape![BM, BK]);
+            let tx = x_part.load([t]).reshape(shape![BK, 1]);
+            acc = mma(tw2, tx, acc);
+        }
+
+        let residual = y.load();
+        y.store(residual + acc.reshape(shape![BM]));
+    }
+
+    #[cutile::entry()]
+    fn rmsnorm_inplace<const BM: i32>(
+        x: &mut Tensor<f32, { [BM] }>, // dim
+        w: &Tensor<f32, { [-1] }>,     // dim
+    ) {
+        let dim = w.shape()[0];
+
+        let tx = load_tile(x, shape![BM], [program_id(0)]);
+        let tw = w.load_like(x);
+
+        let sum: Tile<f32, { [1] }> = reduce_sum(tx * tx, 0);
+        let mean = sum.reshape(shape![1]) / broadcast_scalar(convert_scalar::<f32>(dim), shape![1]);
+
+        let ep = constant(1e-5f32, shape![1]);
+        let one = constant(1.0f32, shape![1]);
+
+        let scale = one / sqrt(mean + ep, rounding::Zero, ftz::Disabled);
+        let scale = scale.broadcast(shape![BM]);
+
+        x.store(tx * tw * scale);
+    }
+
+    #[cutile::entry()]
+    fn matmul_cls<const BM: i32, const BK: i32>(
+        y: &mut Tensor<f32, { [BM] }>, // vocab_size
+        w: &Tensor<f32, { [-1, -1] }>, // vocab_size, dim
+        x: &Tensor<f32, { [-1] }>,     // dim
+    ) {
+        let idx = program_id(0);
+        let dim = x.shape()[0];
+
+        let w_part = w.partition(shape![BM, BK]);
+        let x_part = x.partition(shape![BK]);
+
+        let num_tiles = ceil_div(dim, BK);
+
+        let mut acc = constant(0.0f32, shape![BM, 1]);
+
+        for t in 0..num_tiles {
+            let tw = w_part.load([idx, t]);
+            let tx = x_part.load([t]).reshape(shape![BK, 1]);
+            acc = mma(tw, tx, acc);
+        }
+
+        y.store(acc.reshape(shape![BM]));
     }
 }
 
@@ -398,6 +478,7 @@ impl GpuTransformerWeights {
                 .into();
 
         let wcls = api::copy_host_vec_to_device(&Arc::new(weights_host.wcls().to_vec()))
+            .reshape(&[c.vocab_size, c.dim])
             .sync()
             .unwrap()
             .into();
@@ -421,26 +502,20 @@ impl GpuTransformerWeights {
 
 struct GpuRunState {
     // kv cache
-    key_cache: Arc<Tensor<f32>>,   // (layer, seq_len, dim)
-    value_cache: Arc<Tensor<f32>>, // (layer, seq_len, dim)
+    key_cache: Option<Tensor<f32>>,   // (layer, seq_len, kv_dim)
+    value_cache: Option<Tensor<f32>>, // (layer, seq_len, kv_dim)
 }
 
 impl GpuRunState {
     fn new(c: &Config) -> Self {
         let kv_dim = (c.dim * c.n_kv_heads) / c.n_heads;
 
-        let key_cache = api::zeros(&[c.n_layers, c.seq_len, kv_dim])
-            .sync()
-            .unwrap()
-            .into();
-        let value_cache = api::zeros(&[c.n_layers, c.seq_len, kv_dim])
-            .sync()
-            .unwrap()
-            .into();
+        let key_cache = api::zeros(&[c.n_layers, c.seq_len, kv_dim]).sync().unwrap();
+        let value_cache = api::zeros(&[c.n_layers, c.seq_len, kv_dim]).sync().unwrap();
 
         Self {
-            key_cache,
-            value_cache,
+            key_cache: Some(key_cache),
+            value_cache: Some(value_cache),
         }
     }
 }
@@ -449,6 +524,7 @@ pub struct GpuTransformer {
     config: Config,
     weights: GpuTransformerWeights,
     state: GpuRunState,
+    logits: Vec<f32>,
 }
 
 impl GpuTransformer {
@@ -462,10 +538,15 @@ impl GpuTransformer {
             config: transformer.config,
             weights,
             state,
+            logits: vec![],
         }
     }
 
-    pub fn forward(&mut self, token: usize, pos: usize) {
+    pub fn get_vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+
+    pub fn forward(&mut self, token: usize, pos: usize) -> &mut [f32] {
         // a few convenience variables
         let p = &mut self.config;
         let w = &mut self.weights;
@@ -480,89 +561,107 @@ impl GpuTransformer {
         let start = token * dim;
         let x_h = w.token_embedding_table[start..start + dim].to_owned();
 
-        let mut x_d: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(x_h.clone()))
-            .sync()
-            .unwrap()
-            .into();
+        let mut x_d: Tensor<f32> = api::copy_host_vec_to_device(&Arc::new(x_h)).sync().unwrap();
+
+        let mut xb_d = api::zeros::<f32>(&[dim]).sync().unwrap();
+
+        // tile size
+        let dim_ts = dim.next_power_of_two() / 2;
+        let kv_dim_ts = kv_dim.next_power_of_two() / 2;
+        let head_size_ts = head_size.next_power_of_two();
+
+        // move cache ownership
+        let mut key_cache = s.key_cache.take().unwrap();
+        let mut val_cache = s.value_cache.take().unwrap();
 
         // forward all the layers
         for l in 0..p.n_layers {
             // attention rmsnorm
-            let start = l * dim;
-            let xb_d = api::zeros(&[dim]).sync().unwrap().partition([dim]);
-
-            let (y, _, _) = kernel::rmsnorm(xb_d, &x_d, &w.rms_att_weight)
+            let xb_p = (&mut xb_d).partition([dim_ts]);
+            let (_, _, _, _) = kernel::rmsnorm(xb_p, &x_d, &w.rms_att_weight, l as i32)
                 .sync()
                 .unwrap();
-            let xb_d = y.unpartition();
-
-            // key and value point to the kv cache
-            let loff = l * p.seq_len * kv_dim;
-            let start = loff + pos * kv_dim;
 
             // qkv matmuls for this position
-            let q_d = api::zeros(&[dim]).sync().unwrap().partition([dim]);
-            let (tq, _, _, _) = kernel::matmul_1d(q_d, &w.wq, &xb_d, l as i32)
+            let mut q_d = api::zeros(&[dim]).sync().unwrap();
+            let q_part = (&mut q_d).partition([dim_ts]);
+            let (_, _, _, _) = kernel::matmul_q(q_part, &w.wq, &xb_d, l as i32)
                 .sync()
                 .unwrap();
 
-            let cache = Arc::get_mut(&mut s.key_cache).expect("key_cache ownership");
-            let tk = cache.partition([1, 1, kv_dim]);
-            let (tk, _, _, _, _) = kernel::matmul(tk, &w.wk, &xb_d, l as i32, pos as i32)
+            // TODO Change to MappedPartition
+            let k_part = (&mut key_cache).partition([1, 1, kv_dim_ts]);
+            let (_, _, _, _, _) = kernel::matmul_kv(k_part, &w.wk, &xb_d, l as i32, pos as i32)
                 .sync()
                 .unwrap();
 
-            let cache = Arc::get_mut(&mut s.value_cache).expect("value_cache ownership");
-            let tv = cache.partition([1, 1, kv_dim]);
-            let (tv, _, _, _, _) = kernel::matmul(tv, &w.wv, &xb_d, l as i32, pos as i32)
+            let v_part = (&mut val_cache).partition([1, 1, kv_dim_ts]);
+            let (_, _, _, _, _) = kernel::matmul_kv(v_part, &w.wv, &xb_d, l as i32, pos as i32)
                 .sync()
                 .unwrap();
 
-            let tq = tq.unpartition().partition([head_size]);
-            let tk = tk.unpartition().partition([1, 1, head_size]);
+            // rope q
+            let mut q_d = q_d.reshape(&[p.n_heads, head_size]).unwrap();
+            let q_part = (&mut q_d).partition([1, head_size_ts]);
 
-            let generics = vec![head_size.to_string(), (head_size / 2).to_string()];
-            let (tq, _) = kernel::rope_q(tq, pos as i32)
+            let generics = vec![
+                head_size_ts.to_string(),
+                head_size.to_string(),
+                (head_size_ts / 2).to_string(),
+            ];
+            let (_, _) = kernel::rope_q(q_part, pos as i32)
                 .generics(generics)
                 .sync()
                 .unwrap();
 
-            let generics = vec![head_size.to_string(), (head_size / 2).to_string()];
-            let (tk, _, _) = kernel::rope_k(tk, l as i32, pos as i32)
+            // rope k
+            // TODO Change to MappedPartition
+            key_cache = key_cache
+                .reshape(&[p.n_layers * p.seq_len, p.n_kv_heads, head_size])
+                .unwrap();
+            let k_part = (&mut key_cache).partition([1, 1, head_size_ts]);
+
+            let generics = vec![
+                head_size_ts.to_string(),
+                head_size.to_string(),
+                (head_size_ts / 2).to_string(),
+            ];
+
+            let (_, _, _) = kernel::rope_k(k_part, (l * p.seq_len + pos) as i32, pos as i32)
                 .generics(generics)
                 .sync()
                 .unwrap();
+
+            key_cache = key_cache.reshape(&[p.n_layers, p.seq_len, kv_dim]).unwrap();
 
             // multi-head attention
-            let tq = tq.unpartition(); // [dim] -> [n_heads * head_size] -> [n_heads, head_size]
-            let tk = tk.unpartition(); // [layer, seq_len, kv_dim] -> [layer, seq_len, n_kv_heads * head_size]
+            // q: [dim] -> [n_heads * head_size] -> [n_heads, head_size]
+            // k: [layer, seq_len, kv_dim] -> [layer, seq_len, n_kv_heads * head_size]
             // -> [layer, seq_len, n_kv_heads, head_size] -> [layer, n_kv_heads, seq_len, head_size]
-            let tv = tv.unpartition(); // [layer, seq_len, kv_dim] -> [layer, seq_len, n_kv_heads * head_size]
+            // v: [layer, seq_len, kv_dim] -> [layer, seq_len, n_kv_heads * head_size]
             // -> [layer, seq_len, n_kv_heads, head_size] -> [layer, n_kv_heads, seq_len, head_size]
 
             // score: tq * tk -> [n_heads, seq_len]
             // score * v -> [n_heads, head_size]
 
             // out: [n_heads, head_size] -> [n_heads * head_size] -> [dim]
-            let att_out = api::zeros(&[p.n_heads, head_size])
-                .sync()
-                .unwrap()
-                .partition([1, head_size]);
-            let tq = tq.reshape(&[p.n_heads, head_size]).unwrap();
-            let tk = tk
+            let mut att_out_d = api::zeros::<f32>(&[p.n_heads, head_size]).sync().unwrap();
+            let k_view = key_cache
                 .view(&[p.n_layers, p.seq_len, p.n_kv_heads, head_size])
                 .unwrap();
-            let tv = tv
+            let v_view = val_cache
                 .view(&[p.n_layers, p.seq_len, p.n_kv_heads, head_size])
                 .unwrap();
 
+            let att_out_part = (&mut att_out_d).partition([1, head_size_ts]);
+
             let qk_scale = 1.0 / f32::sqrt(head_size as f32);
-            let generics = vec![head_size.to_string(), (4).to_string()];
-            let (att_out, tq, tk, tv, _, _, _, _) = kernel::mha(
-                att_out,
-                tq,
-                &tk,
-                &tv,
+            let generics = vec![head_size_ts.to_string(), (4).to_string()];
+            let (_, _, _, _, _, _, _, _) = kernel::mha(
+                att_out_part,
+                &q_d,
+                &k_view,
+                &v_view,
                 l as i32,
                 pos as i32,
                 kv_mul as i32,
@@ -573,34 +672,76 @@ impl GpuTransformer {
             .unwrap();
 
             // final matmul to get the output of the attention
-            let att_out = att_out.unpartition();
-            let x_mut = Arc::get_mut(&mut x_d).expect("x_d must have exclusive ownership");
-            let out = x_mut.partition([dim]);
+            att_out_d = att_out_d.reshape(&[dim]).unwrap(); // flatten
 
-            let (out, _, _, _) = kernel::fmatmul(out, &att_out, &w.wo, l as i32)
+            let x_part = (&mut x_d).partition([dim_ts]);
+
+            let (_, _, _, _) = kernel::fmatmul(x_part, &w.wo, &att_out_d, l as i32)
                 .sync()
                 .unwrap();
-            let out = out.unpartition();
 
             // ffn rmsnorm
-            let frms_out = api::zeros(&[dim]).partition([dim]).sync().unwrap();
-            let (frms_out, _, _) = kernel::rmsnorm(frms_out, &*out, &w.rms_ffn_weight)
+            let xb_part = (&mut xb_d).partition([dim_ts]);
+            let (_, _, _, _) = kernel::rmsnorm(xb_part, &x_d, &w.rms_ffn_weight, l as i32)
                 .sync()
                 .unwrap();
-            let frms_out = frms_out.unpartition();
 
-            // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
-            let (_, _, _, _, _, _) = kernel::fffn(
-                out.partition([dim]),
-                &frms_out,
-                &w.w1,
-                &w.w2,
-                &w.w3,
-                l as i32,
-            )
-            .generics(vec![dim.to_string(), hidden_dim.to_string()])
+            // F.silu(self.w1(x)) * self.w3(x)
+            let hd_ts = 64; // hidden dim tile size
+            let d_ts = 64; // dim tile size;
+            let silu_out = api::zeros::<f32>(&[hidden_dim])
+                .sync()
+                .unwrap()
+                .partition([hd_ts]);
+
+            let generics = vec![hd_ts.to_string(), d_ts.to_string()];
+            let (silu_out, _, _, _, _) =
+                kernel::matmul_silu(silu_out, &w.w1, &w.w3, &xb_d, l as i32)
+                    .generics(generics)
+                    .sync()
+                    .unwrap();
+            let silu_out = silu_out.unpartition();
+
+            // x + self.w2(h)
+            let x_part = (&mut x_d).partition([d_ts]);
+
+            let generics = vec![d_ts.to_string(), hd_ts.to_string()];
+            let (_, _, _, _) = kernel::matmul_ffn(x_part, &w.w2, silu_out, l as i32)
+                .generics(generics)
+                .sync()
+                .unwrap();
+        }
+
+        // final rmsnorm
+        let x_part = (&mut x_d).partition([dim.next_power_of_two()]);
+        let (_, _) = kernel::rmsnorm_inplace(x_part, &w.rms_final_weight)
             .sync()
             .unwrap();
-        }
+
+        // classifier into logits
+        let vocab_ts = 32; // vocab_size tile size
+        let d_ts = 64; // dim tile size;
+        let logits_d = api::zeros::<f32>(&[p.vocab_size])
+            .sync()
+            .unwrap()
+            .partition([vocab_ts]);
+
+        let generics = vec![vocab_ts.to_string(), d_ts.to_string()];
+        let (logits_d, _, _) = kernel::matmul_cls(logits_d, &w.wcls, &x_d)
+            .generics(generics)
+            .sync()
+            .unwrap();
+        let logits_d = logits_d.unpartition();
+
+        let logits = logits_d.to_host_vec().sync().unwrap();
+
+        self.logits = logits;
+
+        // restore kv cache
+        s.key_cache = Some(key_cache);
+        s.value_cache = Some(val_cache);
+
+        // return
+        &mut self.logits
     }
 }

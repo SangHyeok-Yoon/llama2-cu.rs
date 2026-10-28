@@ -876,39 +876,36 @@ fn generate(
 }
 
 fn main() {
-    // // transformer
-    // let model_path = Path::new("stories15M.bin");
-    // let transformer = Transformer::from_file(model_path);
-
-    // // tokenizer
-    // let tokenizer_path = "tokenizer.bin";
-    // let tokenizer = Tokenizer::from_file(tokenizer_path, transformer.get_vocab_size());
-
-    // // sampler
-    // let sampler = Sampler::new(transformer.get_vocab_size(), 1.0, 0.9);
-
-    // // input
-    // let mut args = std::env::args().skip(1);
-    // let mut prompt = String::from("There was");
-
-    // while let Some(arg) = args.next() {
-    //     match arg.as_str() {
-    //         "-i" => {
-    //             prompt = args.next().unwrap_or_else(|| {
-    //                 eprintln!("Usage: -i \"prompt\"");
-    //                 exit(1);
-    //             });
-    //         }
-    //         _ => {
-    //             eprintln!("Can not parse input arguments.");
-    //             exit(1);
-    //         }
-    //     }
-    // }
-
-    // // run!
-    // generate(transformer, tokenizer, sampler, prompt.as_bytes(), 256);
-
+    // transformer
     let model_path = Path::new("stories15M.bin");
-    let transformer = GpuTransformer::from_file(model_path);
+    let transformer = Transformer::from_file(model_path);
+
+    // tokenizer
+    let tokenizer_path = "tokenizer.bin";
+    let tokenizer = Tokenizer::from_file(tokenizer_path, transformer.get_vocab_size());
+
+    // sampler
+    let sampler = Sampler::new(transformer.get_vocab_size(), 1.0, 0.9);
+
+    // input
+    let mut args = std::env::args().skip(1);
+    let mut prompt = String::from("There was");
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-i" => {
+                prompt = args.next().unwrap_or_else(|| {
+                    eprintln!("Usage: -i \"prompt\"");
+                    exit(1);
+                });
+            }
+            _ => {
+                eprintln!("Can not parse input arguments.");
+                exit(1);
+            }
+        }
+    }
+
+    // run!
+    generate(transformer, tokenizer, sampler, prompt.as_bytes(), 256);
 }
