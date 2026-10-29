@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::{Config, Transformer, TransformerWeights};
+use crate::{Config, Inference, Transformer, TransformerWeights};
 
 use cutile::prelude::*;
 
@@ -541,12 +541,14 @@ impl GpuTransformer {
             logits: vec![],
         }
     }
+}
 
-    pub fn get_vocab_size(&self) -> usize {
+impl Inference for GpuTransformer {
+    fn get_vocab_size(&self) -> usize {
         self.config.vocab_size
     }
 
-    pub fn forward(&mut self, token: usize, pos: usize) -> &mut [f32] {
+    fn forward(&mut self, token: usize, pos: usize) -> &mut [f32] {
         // a few convenience variables
         let p = &mut self.config;
         let w = &mut self.weights;

@@ -40,7 +40,12 @@ impl Config {
     }
 }
 
-struct TransformerWeights {
+trait Inference {
+    fn get_vocab_size(&self) -> usize;
+    fn forward(&mut self, token: usize, pos: usize) -> &mut [f32];
+}
+
+pub struct TransformerWeights {
     data: Vec<f32>,
 
     // token embedding table
@@ -258,7 +263,9 @@ impl Transformer {
             state,
         }
     }
+}
 
+impl Inference for Transformer {
     fn get_vocab_size(&self) -> usize {
         self.config.vocab_size
     }
@@ -830,7 +837,7 @@ impl Sampler {
 }
 
 fn generate(
-    mut transformer: Transformer,
+    transformer: &mut dyn Inference,
     mut tokenizer: Tokenizer,
     sampler: Sampler,
     prompt: &[u8],
@@ -875,22 +882,18 @@ fn generate(
     println!()
 }
 
+enum Mode {
+    Cpu,
+    Gpu,
+}
+
 fn main() {
-    // transformer
-    let model_path = Path::new("stories15M.bin");
-    let transformer = Transformer::from_file(model_path);
-
-    // tokenizer
-    let tokenizer_path = "tokenizer.bin";
-    let tokenizer = Tokenizer::from_file(tokenizer_path, transformer.get_vocab_size());
-
-    // sampler
-    let sampler = Sampler::new(transformer.get_vocab_size(), 1.0, 0.9);
-
-    // input
-    let mut args = std::env::args().skip(1);
+    // default parameters
     let mut prompt = String::from("There was");
+    let mut mode = Mode::Cpu;
 
+    // parse user arguments
+    let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-i" => {
@@ -899,6 +902,21 @@ fn main() {
                     exit(1);
                 });
             }
+            "-m" => {
+                let mode_str = args.next().unwrap_or_else(|| {
+                    eprintln!("Usage: -m [cpu|gpu]");
+                    exit(1);
+                });
+
+                mode = match mode_str.to_lowercase().as_str() {
+                    "cpu" => Mode::Cpu,
+                    "gpu" => Mode::Gpu,
+                    _ => {
+                        eprintln!("Invalid mode: {mode_str}. Use cpu or gpu.");
+                        exit(1);
+                    }
+                };
+            }
             _ => {
                 eprintln!("Can not parse input arguments.");
                 exit(1);
@@ -906,6 +924,26 @@ fn main() {
         }
     }
 
+    // model and tokenizer path
+    let model_path = Path::new("stories15M.bin");
+    let tokenizer_path = Path::new("tokenizer.bin");
+
+    // make transformer, tokenizer, sampler
+    let mut transformer: Box<dyn Inference> = match mode {
+        Mode::Cpu => Box::new(Transformer::from_file(model_path)),
+        Mode::Gpu => Box::new(GpuTransformer::from_file(model_path)),
+    };
+    let vocab_size = transformer.get_vocab_size();
+
+    let tokenizer = Tokenizer::from_file(tokenizer_path, vocab_size);
+    let sampler = Sampler::new(vocab_size, 1.0, 0.9);
+
     // run!
-    generate(transformer, tokenizer, sampler, prompt.as_bytes(), 256);
+    generate(
+        transformer.as_mut(),
+        tokenizer,
+        sampler,
+        prompt.as_bytes(),
+        256,
+    );
 }
