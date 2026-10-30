@@ -511,23 +511,44 @@ impl GpuTransformerWeights {
 
 struct GpuRunState {
     // kv cache
-    key_cache: Option<Tensor<f32>>,   // layer, seq_len, kv_dim
-    value_cache: Option<Tensor<f32>>, // layer, seq_len, kv_dim
-    key_raw: Option<Tensor<f32>>,     // kv_dim
+    key_cache: Tensor<f32>,   // layer * seq_len, n_kv_heads, head_size
+    value_cache: Tensor<f32>, // layer, seq_len, kv_dim
+
+    // buffers
+    x_d: Tensor<f32>,           // dim
+    xb_d: Option<Tensor<f32>>,  // dim
+    q_d: Option<Tensor<f32>>,   // dim
+    key_raw: Tensor<f32>,       // kv_dim
+    hb_d: Tensor<f32>,          // hidden_dim
+    logits_d: Arc<Tensor<f32>>, // vocab_size
 }
 
 impl GpuRunState {
     fn new(c: &Config) -> Self {
+        let head_size = c.dim / c.n_heads;
         let kv_dim = (c.dim * c.n_kv_heads) / c.n_heads;
 
-        let key_cache = api::zeros(&[c.n_layers, c.seq_len, kv_dim]).sync().unwrap();
+        let key_cache = api::zeros(&[c.n_layers * c.seq_len, c.n_kv_heads, head_size])
+            .sync()
+            .unwrap();
         let value_cache = api::zeros(&[c.n_layers, c.seq_len, kv_dim]).sync().unwrap();
+
+        let x_d = api::zeros::<f32>(&[c.dim]).sync().unwrap();
+        let xb_d = api::zeros::<f32>(&[c.dim]).sync().unwrap();
+        let q_d = api::zeros::<f32>(&[c.dim]).sync().unwrap();
         let key_raw = api::zeros(&[kv_dim]).sync().unwrap();
+        let hb_d = api::zeros::<f32>(&[c.hidden_dim]).sync().unwrap();
+        let logits_d = api::zeros::<f32>(&[c.vocab_size]).sync().unwrap();
 
         Self {
-            key_cache: Some(key_cache),
-            value_cache: Some(value_cache),
-            key_raw: Some(key_raw),
+            key_cache,
+            value_cache,
+            x_d,
+            xb_d: Some(xb_d),
+            q_d: Some(q_d),
+            key_raw,
+            hb_d,
+            logits_d: Arc::new(logits_d),
         }
     }
 }
@@ -569,82 +590,84 @@ impl Inference for GpuTransformer {
         let dim = p.dim;
         let kv_dim = (p.dim * p.n_kv_heads) / p.n_heads;
         let kv_mul = p.n_heads / p.n_kv_heads;
-        let hidden_dim = p.hidden_dim;
         let head_size = dim / p.n_heads;
 
         let start = token * dim;
         let x_h = w.token_embedding_table[start..start + dim].to_owned();
 
-        let mut x_d: Tensor<f32> = api::copy_host_vec_to_device(&Arc::new(x_h)).sync().unwrap();
+        // buffers
+        let mut key_cache = &mut s.key_cache;
+        let mut val_cache = &mut s.value_cache;
 
-        let mut xb_d = api::zeros::<f32>(&[dim]).sync().unwrap();
+        let mut x_d = &mut s.x_d;
+        let mut xb_d = s.xb_d.take().unwrap();
+        let mut q_d = s.q_d.take().unwrap();
+        let mut key_raw = &mut s.key_raw;
+        let mut hb_d = &mut s.hb_d;
+        let logits_d = &mut s.logits_d;
+
+        // copy input
+        *x_d = api::copy_host_vec_to_device(&Arc::new(x_h)).sync().unwrap();
 
         // tile size
         let dim_ts = dim.next_power_of_two() / 2;
         let kv_dim_ts = kv_dim.next_power_of_two() / 2;
         let head_size_ts = head_size.next_power_of_two();
 
-        // move cache ownership
-        let mut key_cache = s.key_cache.take().unwrap();
-        let mut val_cache = s.value_cache.take().unwrap();
-        let mut key_raw = s.key_raw.take().unwrap();
-
         // forward all the layers
         for l in 0..p.n_layers {
             // attention rmsnorm
             let xb_p = (&mut xb_d).partition([dim_ts]);
-            let (_, _, _, _) = kernel::rmsnorm(xb_p, &x_d, &w.rms_att_weight, l as i32)
+            let _ = kernel::rmsnorm(xb_p, &*x_d, &w.rms_att_weight, l as i32)
+                .first()
                 .sync()
                 .unwrap();
 
             // qkv matmuls for this position
-            let mut q_d = api::zeros(&[dim]).sync().unwrap();
-            let q_part = (&mut q_d).partition([dim_ts]);
-            let (_, _, _, _) = kernel::matmul_qk(q_part, &w.wq, &xb_d, l as i32)
+            let q_p = (&mut q_d).partition([dim_ts]);
+            let _ = kernel::matmul_qk(q_p, &w.wq, &xb_d, l as i32)
+                .first()
                 .sync()
                 .unwrap();
 
             let num_tile_blocks = kv_dim.div_ceil(kv_dim_ts);
 
-            let k_raw_part = (&mut key_raw).partition([kv_dim_ts]);
-            let _ = kernel::matmul_qk(k_raw_part, &w.wk, &xb_d, l as i32)
+            let k_raw_p = (&mut key_raw).partition([kv_dim_ts]);
+            let _ = kernel::matmul_qk(k_raw_p, &w.wk, &xb_d, l as i32)
                 .first()
                 .sync()
                 .unwrap();
 
-            let v_part = (&mut val_cache)
+            let v_p = (&mut val_cache)
                 .partition([1, 1, kv_dim_ts])
                 .map([1, 1, 1], num_tile_blocks as u32);
-            let _ = kernel::matmul_v(v_part, &w.wv, &xb_d, l as i32, pos as i32)
+            let _ = kernel::matmul_v(v_p, &w.wv, &xb_d, l as i32, pos as i32)
                 .first()
                 .sync()
                 .unwrap();
 
             // rope q
-            let mut q_d = q_d.reshape(&[p.n_heads, head_size]).unwrap();
-            let q_part = (&mut q_d).partition([1, head_size_ts]);
+            q_d = q_d.reshape(&[p.n_heads, head_size]).unwrap();
+            let q_p = (&mut q_d).partition([1, head_size_ts]);
 
             let generics = vec![
                 head_size_ts.to_string(),
                 head_size.to_string(),
                 (head_size_ts / 2).to_string(),
             ];
-            let (_, _) = kernel::rope_q(q_part, pos as i32)
+            let _ = kernel::rope_q(q_p, pos as i32)
                 .generics(generics)
+                .first()
                 .sync()
                 .unwrap();
 
             // rope k
-            key_cache = key_cache
-                .reshape(&[p.n_layers * p.seq_len, p.n_kv_heads, head_size])
-                .unwrap();
-
             let map_shape = [1, 1, 1];
-            let k_part = (&mut key_cache)
+            let k_p = (&mut key_cache)
                 .partition([1, 1, head_size_ts])
                 .map(map_shape, p.n_kv_heads as u32);
 
-            let k_raw_view = key_raw.view(&[p.n_kv_heads, head_size]).unwrap();
+            let k_raw_v = key_raw.view(&[p.n_kv_heads, head_size]).unwrap();
 
             let generics = vec![
                 head_size_ts.to_string(),
@@ -655,18 +678,11 @@ impl Inference for GpuTransformer {
                 map_shape[2].to_string(),
             ];
 
-            let _ = kernel::rope_k(
-                k_part,
-                &k_raw_view,
-                (l * p.seq_len + pos) as i32,
-                pos as i32,
-            )
-            .generics(generics)
-            .first()
-            .sync()
-            .unwrap();
-
-            key_cache = key_cache.reshape(&[p.n_layers, p.seq_len, kv_dim]).unwrap();
+            let _ = kernel::rope_k(k_p, &k_raw_v, (l * p.seq_len + pos) as i32, pos as i32)
+                .generics(generics)
+                .first()
+                .sync()
+                .unwrap();
 
             // multi-head attention
             // q: [dim] -> [n_heads * head_size] -> [n_heads, head_size]
@@ -679,23 +695,23 @@ impl Inference for GpuTransformer {
             // score * v -> [n_heads, head_size]
 
             // out: [n_heads, head_size] -> [n_heads * head_size] -> [dim]
-            let mut att_out_d = api::zeros::<f32>(&[p.n_heads, head_size]).sync().unwrap();
-            let k_view = key_cache
+            let k_v = key_cache
                 .view(&[p.n_layers, p.seq_len, p.n_kv_heads, head_size])
                 .unwrap();
-            let v_view = val_cache
+            let v_v = val_cache
                 .view(&[p.n_layers, p.seq_len, p.n_kv_heads, head_size])
                 .unwrap();
 
-            let att_out_part = (&mut att_out_d).partition([1, head_size_ts]);
+            xb_d = xb_d.reshape(&[p.n_heads, head_size]).unwrap();
+            let xb_part = (&mut xb_d).partition([1, head_size_ts]);
 
             let qk_scale = 1.0 / f32::sqrt(head_size as f32);
             let generics = vec![head_size_ts.to_string(), (4).to_string()];
             let (_, _, _, _, _, _, _, _) = kernel::mha(
-                att_out_part,
+                xb_part,
                 &q_d,
-                &k_view,
-                &v_view,
+                &k_v,
+                &v_v,
                 l as i32,
                 pos as i32,
                 kv_mul as i32,
@@ -705,42 +721,42 @@ impl Inference for GpuTransformer {
             .sync()
             .unwrap();
 
+            q_d = q_d.reshape(&[dim]).unwrap();
+
             // final matmul to get the output of the attention
-            att_out_d = att_out_d.reshape(&[dim]).unwrap(); // flatten
+            xb_d = xb_d.reshape(&[dim]).unwrap(); // flatten
 
-            let x_part = (&mut x_d).partition([dim_ts]);
+            let x_p = (&mut x_d).partition([dim_ts]);
 
-            let (_, _, _, _) = kernel::fmatmul(x_part, &w.wo, &att_out_d, l as i32)
+            let _ = kernel::fmatmul(x_p, &w.wo, &xb_d, l as i32)
+                .first()
                 .sync()
                 .unwrap();
 
             // ffn rmsnorm
             let xb_part = (&mut xb_d).partition([dim_ts]);
-            let (_, _, _, _) = kernel::rmsnorm(xb_part, &x_d, &w.rms_ffn_weight, l as i32)
+            let (_, _, _, _) = kernel::rmsnorm(xb_part, &*x_d, &w.rms_ffn_weight, l as i32)
                 .sync()
                 .unwrap();
 
             // F.silu(self.w1(x)) * self.w3(x)
             let hd_ts = 64; // hidden dim tile size
             let d_ts = 64; // dim tile size;
-            let silu_out = api::zeros::<f32>(&[hidden_dim])
-                .sync()
-                .unwrap()
-                .partition([hd_ts]);
+
+            let hb_p = (&mut hb_d).partition([hd_ts]);
 
             let generics = vec![hd_ts.to_string(), d_ts.to_string()];
-            let (silu_out, _, _, _, _) =
-                kernel::matmul_silu(silu_out, &w.w1, &w.w3, &xb_d, l as i32)
-                    .generics(generics)
-                    .sync()
-                    .unwrap();
-            let silu_out = silu_out.unpartition();
+            let _ = kernel::matmul_silu(hb_p, &w.w1, &w.w3, &xb_d, l as i32)
+                .generics(generics)
+                .first()
+                .sync()
+                .unwrap();
 
             // x + self.w2(h)
             let x_part = (&mut x_d).partition([d_ts]);
 
             let generics = vec![d_ts.to_string(), hd_ts.to_string()];
-            let (_, _, _, _) = kernel::matmul_ffn(x_part, &w.w2, silu_out, l as i32)
+            let (_, _, _, _) = kernel::matmul_ffn(x_part, &w.w2, &*hb_d, l as i32)
                 .generics(generics)
                 .sync()
                 .unwrap();
@@ -755,26 +771,21 @@ impl Inference for GpuTransformer {
         // classifier into logits
         let vocab_ts = 32; // vocab_size tile size
         let d_ts = 64; // dim tile size;
-        let logits_d = api::zeros::<f32>(&[p.vocab_size])
-            .sync()
-            .unwrap()
-            .partition([vocab_ts]);
+
+        let logits_p = Arc::get_mut(logits_d).unwrap().partition([vocab_ts]);
 
         let generics = vec![vocab_ts.to_string(), d_ts.to_string()];
-        let (logits_d, _, _) = kernel::matmul_cls(logits_d, &w.wcls, &x_d)
+        let _ = kernel::matmul_cls(logits_p, &w.wcls, &*x_d)
             .generics(generics)
+            .first()
             .sync()
             .unwrap();
-        let logits_d = logits_d.unpartition();
 
-        let logits = logits_d.to_host_vec().sync().unwrap();
-
-        self.logits = logits;
+        self.logits = (&*logits_d).to_host_vec().sync().unwrap();
 
         // restore kv cache
-        s.key_cache = Some(key_cache);
-        s.value_cache = Some(val_cache);
-        s.key_raw = Some(key_raw);
+        s.xb_d = Some(xb_d);
+        s.q_d = Some(q_d);
 
         // return
         &mut self.logits
