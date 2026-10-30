@@ -44,23 +44,21 @@ mod kernel {
     }
 
     #[cutile::entry()]
-    fn matmul_q<const BM: i32>(
-        y: &mut Tensor<f32, { [BM] }>,
-        w: &Tensor<f32, { [-1, -1, -1] }>, // l, dim, dim
+    fn matmul_qk<const BM: i32>(
+        y: &mut Tensor<f32, { [BM] }>,     // dim | kv_dim
+        w: &Tensor<f32, { [-1, -1, -1] }>, // l, dim | kv_dim, dim
         x: &Tensor<f32, { [-1] }>,         // dim
         l: i32,
     ) {
-        let pid0 = program_id(0);
-        let dim = w.shape()[1];
-        let num_tile = ceil_div(dim, BM);
+        let idx = program_id(0);
 
         let w_part = w.partition(shape![1, BM, BM]);
         let x_part = x.partition(shape![BM]);
 
-        let mut ty = load_tile_mut(y).reshape(shape![BM, 1]);
+        let mut ty = constant(0.0f32, shape![BM, 1]);
 
-        for t in 0..num_tile {
-            let tw = w_part.load([l, pid0, t]).reshape(shape![BM, BM]);
+        for t in 0..num_tiles(&w_part, 2) {
+            let tw = w_part.load([l, idx, t]).reshape(shape![BM, BM]);
             let tx = x_part.load([t]).reshape(shape![BM, 1]);
             ty = mma(tw, tx, ty);
         }
@@ -69,30 +67,30 @@ mod kernel {
     }
 
     #[cutile::entry()]
-    fn matmul_kv<const BM: i32>(
-        y: &mut Tensor<f32, { [1, 1, BM] }>, // l, seq_len, kv_dim
-        w: &Tensor<f32, { [-1, -1, -1] }>,   // l, kv_dim, dim
-        x: &Tensor<f32, { [-1] }>,           // dim
+    fn matmul_v<const BM: i32, const MAP_SHAPE: [i32; 3]>(
+        // l, seq_len, kv_dim
+        mut y: MappedPartitionMut<f32, { [1, 1, BM] }, MAP_SHAPE>,
+        w: &Tensor<f32, { [-1, -1, -1] }>, // l, kv_dim, dim
+        x: &Tensor<f32, { [-1] }>,         // dim
         l: i32,
         pos: i32,
     ) {
-        if l == program_id(0) && pos == program_id(1) {
-            let pid2 = program_id(2);
-            let dim = w.shape()[2];
-            let num_tile = ceil_div(dim, BM);
+        let w_part = w.partition(shape![1, BM, BM]);
+        let x_part = x.partition(shape![BM]);
 
-            let w_part = w.partition(shape![1, BM, BM]);
-            let x_part = x.partition(shape![BM]);
+        for idx in y.iter_indices_within([(l, 1i32), (pos, 1i32), (0i32, -1i32)]) {
+            let (layer, _seq, kv_tile) = idx.components();
 
-            let mut ty = load_tile_mut(y).reshape(shape![BM, 1]);
+            let mut ty = constant(0.0f32, shape![BM, 1]);
 
-            for t in 0..num_tile {
-                let tw = w_part.load([l, pid2, t]).reshape(shape![BM, BM]);
+            for t in 0..num_tiles(&w_part, 2) {
+                let tw = w_part.load([layer, kv_tile, t]).reshape(shape![BM, BM]);
                 let tx = x_part.load([t]).reshape(shape![BM, 1]);
+
                 ty = mma(tw, tx, ty);
             }
 
-            y.store(ty.reshape(shape![1, 1, BM]));
+            y.store(ty.reshape(shape![1, 1, BM]), idx);
         }
     }
 
@@ -132,27 +130,37 @@ mod kernel {
     }
 
     #[cutile::entry()]
-    fn rope_k<const HEAD_TILE: i32, const HEAD_SIZE: i32, const HALF_DIM: i32>(
-        k: &mut Tensor<f32, { [1, 1, HEAD_TILE] }>, // n_layers * seq_len, n_kv_heads, head_size
+    fn rope_k<
+        const HEAD_TILE: i32,
+        const HEAD_SIZE: i32,
+        const HALF_DIM: i32,
+        const MAP_SHAPE: [i32; 3],
+    >(
+        // n_layers * seq_len, n_kv_heads, head_size
+        mut k: MappedPartitionMut<f32, { [1, 1, HEAD_TILE] }, MAP_SHAPE>,
+        k_raw: &Tensor<f32, { [-1, -1] }>, // n_kv_heads, head_size
         row: i32,
         pos: i32,
     ) {
-        if row == program_id(0) {
-            let head_dim: Tile<i32, { [HALF_DIM] }> = iota(shape![HALF_DIM]);
-            let head_dim: Tile<f32, { [HALF_DIM] }> = convert_tile(head_dim);
-            let head_dim = head_dim * constant(2.0f32, shape![HALF_DIM]); // step by 2
-            let head_size = broadcast_scalar(convert_scalar::<f32>(HEAD_SIZE), shape![HALF_DIM]);
-            let exponent = head_dim / head_size;
+        let head_dim: Tile<i32, { [HALF_DIM] }> = iota(shape![HALF_DIM]);
+        let head_dim: Tile<f32, { [HALF_DIM] }> = convert_tile(head_dim);
+        let head_dim = head_dim * constant(2.0f32, shape![HALF_DIM]); // step by 2
+        let head_size = broadcast_scalar(convert_scalar::<f32>(HEAD_SIZE), shape![HALF_DIM]);
+        let exponent = head_dim / head_size;
 
-            let base = constant(10000.0f32, shape![HALF_DIM]);
-            let freq = constant(1.0f32, shape![HALF_DIM]) / pow(base, exponent);
+        let base = constant(10000.0f32, shape![HALF_DIM]);
+        let freq = constant(1.0f32, shape![HALF_DIM]) / pow(base, exponent);
 
-            let val = broadcast_scalar(convert_scalar::<f32>(pos), shape![HALF_DIM]) * freq;
-            let fcr = cos(val).reshape(shape![HALF_DIM, 1]);
-            let fci = sin(val).reshape(shape![HALF_DIM, 1]);
+        let val = broadcast_scalar(convert_scalar::<f32>(pos), shape![HALF_DIM]) * freq;
+        let fcr = cos(val).reshape(shape![HALF_DIM, 1]);
+        let fci = sin(val).reshape(shape![HALF_DIM, 1]);
 
-            let pairs = k.load();
-            let pairs = pairs.reshape(shape![HALF_DIM, 2]);
+        let raw_part = k_raw.partition(shape![1, HEAD_TILE]);
+
+        for idx in k.iter_indices_within([(row, 1i32), (0i32, -1i32), (0i32, 1i32)]) {
+            let (_row, head, _head_tile) = idx.components();
+
+            let pairs = raw_part.load([head, 0]).reshape(shape![HALF_DIM, 2]);
 
             let zero = constant(0i32, shape![]);
             let one = constant(1i32, shape![]);
@@ -164,7 +172,8 @@ mod kernel {
             let r1 = v0 * fci + v1 * fcr;
 
             let rotated: Tile<f32, { [HALF_DIM, 2] }> = cat(r0, r1, 1);
-            k.store(rotated.reshape(shape![1, 1, HEAD_TILE]));
+
+            k.store(rotated.reshape(shape![1, 1, HEAD_TILE]), idx);
         }
     }
 
@@ -502,8 +511,9 @@ impl GpuTransformerWeights {
 
 struct GpuRunState {
     // kv cache
-    key_cache: Option<Tensor<f32>>,   // (layer, seq_len, kv_dim)
-    value_cache: Option<Tensor<f32>>, // (layer, seq_len, kv_dim)
+    key_cache: Option<Tensor<f32>>,   // layer, seq_len, kv_dim
+    value_cache: Option<Tensor<f32>>, // layer, seq_len, kv_dim
+    key_raw: Option<Tensor<f32>>,     // kv_dim
 }
 
 impl GpuRunState {
@@ -512,10 +522,12 @@ impl GpuRunState {
 
         let key_cache = api::zeros(&[c.n_layers, c.seq_len, kv_dim]).sync().unwrap();
         let value_cache = api::zeros(&[c.n_layers, c.seq_len, kv_dim]).sync().unwrap();
+        let key_raw = api::zeros(&[kv_dim]).sync().unwrap();
 
         Self {
             key_cache: Some(key_cache),
             value_cache: Some(value_cache),
+            key_raw: Some(key_raw),
         }
     }
 }
@@ -575,6 +587,7 @@ impl Inference for GpuTransformer {
         // move cache ownership
         let mut key_cache = s.key_cache.take().unwrap();
         let mut val_cache = s.value_cache.take().unwrap();
+        let mut key_raw = s.key_raw.take().unwrap();
 
         // forward all the layers
         for l in 0..p.n_layers {
@@ -587,18 +600,23 @@ impl Inference for GpuTransformer {
             // qkv matmuls for this position
             let mut q_d = api::zeros(&[dim]).sync().unwrap();
             let q_part = (&mut q_d).partition([dim_ts]);
-            let (_, _, _, _) = kernel::matmul_q(q_part, &w.wq, &xb_d, l as i32)
+            let (_, _, _, _) = kernel::matmul_qk(q_part, &w.wq, &xb_d, l as i32)
                 .sync()
                 .unwrap();
 
-            // TODO Change to MappedPartition
-            let k_part = (&mut key_cache).partition([1, 1, kv_dim_ts]);
-            let (_, _, _, _, _) = kernel::matmul_kv(k_part, &w.wk, &xb_d, l as i32, pos as i32)
+            let num_tile_blocks = kv_dim.div_ceil(kv_dim_ts);
+
+            let k_raw_part = (&mut key_raw).partition([kv_dim_ts]);
+            let _ = kernel::matmul_qk(k_raw_part, &w.wk, &xb_d, l as i32)
+                .first()
                 .sync()
                 .unwrap();
 
-            let v_part = (&mut val_cache).partition([1, 1, kv_dim_ts]);
-            let (_, _, _, _, _) = kernel::matmul_kv(v_part, &w.wv, &xb_d, l as i32, pos as i32)
+            let v_part = (&mut val_cache)
+                .partition([1, 1, kv_dim_ts])
+                .map([1, 1, 1], num_tile_blocks as u32);
+            let _ = kernel::matmul_v(v_part, &w.wv, &xb_d, l as i32, pos as i32)
+                .first()
                 .sync()
                 .unwrap();
 
@@ -617,22 +635,36 @@ impl Inference for GpuTransformer {
                 .unwrap();
 
             // rope k
-            // TODO Change to MappedPartition
             key_cache = key_cache
                 .reshape(&[p.n_layers * p.seq_len, p.n_kv_heads, head_size])
                 .unwrap();
-            let k_part = (&mut key_cache).partition([1, 1, head_size_ts]);
+
+            let map_shape = [1, 1, 1];
+            let k_part = (&mut key_cache)
+                .partition([1, 1, head_size_ts])
+                .map(map_shape, p.n_kv_heads as u32);
+
+            let k_raw_view = key_raw.view(&[p.n_kv_heads, head_size]).unwrap();
 
             let generics = vec![
                 head_size_ts.to_string(),
                 head_size.to_string(),
                 (head_size_ts / 2).to_string(),
+                map_shape[0].to_string(),
+                map_shape[1].to_string(),
+                map_shape[2].to_string(),
             ];
 
-            let (_, _, _) = kernel::rope_k(k_part, (l * p.seq_len + pos) as i32, pos as i32)
-                .generics(generics)
-                .sync()
-                .unwrap();
+            let _ = kernel::rope_k(
+                k_part,
+                &k_raw_view,
+                (l * p.seq_len + pos) as i32,
+                pos as i32,
+            )
+            .generics(generics)
+            .first()
+            .sync()
+            .unwrap();
 
             key_cache = key_cache.reshape(&[p.n_layers, p.seq_len, kv_dim]).unwrap();
 
@@ -742,6 +774,7 @@ impl Inference for GpuTransformer {
         // restore kv cache
         s.key_cache = Some(key_cache);
         s.value_cache = Some(val_cache);
+        s.key_raw = Some(key_raw);
 
         // return
         &mut self.logits
