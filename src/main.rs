@@ -838,8 +838,8 @@ impl Sampler {
 
 fn generate(
     transformer: &mut dyn Inference,
-    mut tokenizer: Tokenizer,
-    sampler: Sampler,
+    tokenizer: &mut Tokenizer,
+    sampler: &mut Sampler,
     prompt: &[u8],
     steps: usize,
 ) {
@@ -882,6 +882,35 @@ fn generate(
     println!()
 }
 
+fn run(
+    transformer: &mut dyn Inference,
+    tokenizer: &mut Tokenizer,
+    sampler: &mut Sampler,
+    prompt: &[u8],
+    steps: usize,
+) {
+    let loop_mode = prompt.is_empty();
+
+    if !loop_mode {
+        generate(transformer, tokenizer, sampler, prompt, steps);
+        return;
+    }
+
+    loop {
+        print!("prompt> ");
+        io::stdout().flush().expect("Flush error!");
+        
+        let mut prompt = String::new();
+        if io::stdin().read_line(&mut prompt).expect("Input failed!") == 0 {
+            break;
+        }
+        
+        let input = prompt.trim_end_matches(['\r', '\n']);
+
+        generate(transformer, tokenizer, sampler, input.as_bytes(), steps);
+    }
+}
+
 enum Mode {
     Cpu,
     Gpu,
@@ -889,7 +918,7 @@ enum Mode {
 
 fn main() {
     // default parameters
-    let mut prompt = String::from("There was");
+    let mut prompt = String::new();
     let mut mode = Mode::Cpu;
 
     // parse user arguments
@@ -934,19 +963,20 @@ fn main() {
         Mode::Gpu => {
             let mut transformer = GpuTransformer::from_file(model_path);
             transformer.build_graph();
+            transformer.warnup();
             Box::new(transformer)
         }
     };
     let vocab_size = transformer.get_vocab_size();
 
-    let tokenizer = Tokenizer::from_file(tokenizer_path, vocab_size);
-    let sampler = Sampler::new(vocab_size, 1.0, 0.9);
+    let mut tokenizer = Tokenizer::from_file(tokenizer_path, vocab_size);
+    let mut sampler = Sampler::new(vocab_size, 1.0, 0.9);
 
     // run!
-    generate(
+    run(
         transformer.as_mut(),
-        tokenizer,
-        sampler,
+        &mut tokenizer,
+        &mut sampler,
         prompt.as_bytes(),
         256,
     );

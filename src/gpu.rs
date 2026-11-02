@@ -627,6 +627,13 @@ impl GpuTransformer {
         }
     }
 
+    pub fn warnup(&mut self) {
+        match self.graph {
+            Some(_) => self.graph_forward(1, 0),
+            None => self.eager_forward(1, 0),
+        }
+    }
+
     pub fn build_graph(&mut self) {
         // a few convenience variables
         let p = &mut self.config;
