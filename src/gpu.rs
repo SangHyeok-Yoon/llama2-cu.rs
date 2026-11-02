@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::{Config, Inference, Transformer, TransformerWeights};
 
-use cutile::prelude::*;
+use cutile::{cuda_core::Stream, prelude::*};
 
 #[cutile::module]
 mod kernel {
@@ -603,6 +603,8 @@ pub struct GpuTransformer {
     weights: GpuTransformerWeights,
     state: GpuRunState,
     logits: Vec<f32>,
+    stream: Arc<Stream>,
+    graph: Option<CudaGraph<()>>,
 }
 
 impl GpuTransformer {
@@ -612,21 +614,205 @@ impl GpuTransformer {
             GpuTransformerWeights::from_weights(&transformer.weights, &transformer.config);
         let state = GpuRunState::new(&transformer.config);
 
+        let device = Device::new(0).unwrap();
+        let stream = device.new_stream().unwrap();
+
         Self {
             config: transformer.config,
             weights,
             state,
             logits: vec![],
+            stream,
+            graph: None,
         }
     }
-}
 
-impl Inference for GpuTransformer {
-    fn get_vocab_size(&self) -> usize {
-        self.config.vocab_size
+    pub fn build_graph(&mut self) {
+        // a few convenience variables
+        let p = &mut self.config;
+        let w = &mut self.weights;
+        let state = &mut self.state;
+
+        let dim = p.dim;
+        let kv_dim = (p.dim * p.n_kv_heads) / p.n_heads;
+        let kv_mul = p.n_heads / p.n_kv_heads;
+        let head_size = dim / p.n_heads;
+
+        let qk_scale = 1.0 / f32::sqrt(head_size as f32);
+
+        // buffers
+        let mut key_cache = &mut state.key_cache;
+        let mut val_cache = &mut state.value_cache;
+
+        let mut x_d = &mut state.x_d;
+
+        let mut key_raw = &mut state.key_raw;
+        let mut hb_d = &mut state.hb_d;
+        let logits_d = &mut state.logits_d;
+
+        let pos_d = &mut state.pos_d;
+
+        // tile size
+        let dim_ts = dim.next_power_of_two() / 2;
+        let kv_dim_ts = kv_dim.next_power_of_two() / 2;
+        let num_tile_blocks = kv_dim.div_ceil(kv_dim_ts);
+        let head_size_ts = head_size.next_power_of_two();
+
+        // Capture graph
+        let graph = CudaGraph::scope(&self.stream, |s| {
+            // take ownership
+            let mut xb_d = state.xb_d.take().unwrap();
+            let mut q_d = state.q_d.take().unwrap();
+
+            for l in 0..p.n_layers {
+                // attention rmsnorm
+                let xb_p = (&mut xb_d).partition([dim_ts]);
+                s.record(kernel::rmsnorm(xb_p, &*x_d, &w.rms_att_weight, l as i32))?;
+
+                // qkv matmuls for this position
+                let q_p = (&mut q_d).partition([dim_ts]);
+                s.record(kernel::matmul_qk(q_p, &w.wq, &xb_d, l as i32))?;
+
+                let k_raw_p = (&mut key_raw).partition([kv_dim_ts]);
+                s.record(kernel::matmul_qk(k_raw_p, &w.wk, &xb_d, l as i32))?;
+
+                let v_p = (&mut val_cache)
+                    .partition([1, 1, kv_dim_ts])
+                    .map([1, 1, 1], num_tile_blocks as u32);
+                s.record(kernel::matmul_v(v_p, &w.wv, &xb_d, &*pos_d, l as i32))?;
+
+                // rope q
+                q_d = q_d.reshape(&[p.n_heads, head_size])?;
+                let q_p = (&mut q_d).partition([1, head_size_ts]);
+
+                let generics = vec![
+                    head_size_ts.to_string(),
+                    head_size.to_string(),
+                    (head_size_ts / 2).to_string(),
+                ];
+                s.record(kernel::rope_q(q_p, &*pos_d).generics(generics))?;
+
+                // rope k
+                let map_shape = [1, 1, 1];
+                let k_p = (&mut key_cache)
+                    .partition([1, 1, head_size_ts])
+                    .map(map_shape, p.n_kv_heads as u32);
+
+                let k_raw_v = key_raw.view(&[p.n_kv_heads, head_size]).unwrap();
+
+                let generics = vec![
+                    head_size_ts.to_string(),
+                    head_size.to_string(),
+                    (head_size_ts / 2).to_string(),
+                    map_shape[0].to_string(),
+                    map_shape[1].to_string(),
+                    map_shape[2].to_string(),
+                ];
+
+                s.record(
+                    kernel::rope_k(k_p, &k_raw_v, &*pos_d, l as i32, p.seq_len as i32)
+                        .generics(generics),
+                )?;
+
+                let k_v = key_cache.view(&[p.n_layers, p.seq_len, p.n_kv_heads, head_size])?;
+                let v_v = val_cache.view(&[p.n_layers, p.seq_len, p.n_kv_heads, head_size])?;
+
+                xb_d = xb_d.reshape(&[p.n_heads, head_size])?;
+                let xb_part = (&mut xb_d).partition([1, head_size_ts]);
+
+                let generics = vec![head_size_ts.to_string(), (4).to_string()];
+                s.record(
+                    kernel::mha(
+                        xb_part,
+                        &q_d,
+                        &k_v,
+                        &v_v,
+                        &*pos_d,
+                        l as i32,
+                        kv_mul as i32,
+                        qk_scale,
+                    )
+                    .generics(generics),
+                )?;
+
+                q_d = q_d.reshape(&[dim]).unwrap();
+
+                // final matmul to get the output of the attention
+                xb_d = xb_d.reshape(&[dim])?; // flatten
+
+                let x_p = (&mut x_d).partition([dim_ts]);
+
+                s.record(kernel::fmatmul(x_p, &w.wo, &xb_d, l as i32))?;
+
+                // ffn rmsnorm
+                let xb_part = (&mut xb_d).partition([dim_ts]);
+                s.record(kernel::rmsnorm(xb_part, &*x_d, &w.rms_ffn_weight, l as i32))?;
+
+                // F.silu(self.w1(x)) * self.w3(x)
+                let hd_ts = 64; // hidden dim tile size
+                let d_ts = 64; // dim tile size;
+
+                let hb_p = (&mut hb_d).partition([hd_ts]);
+
+                let generics = vec![hd_ts.to_string(), d_ts.to_string()];
+                s.record(
+                    kernel::matmul_silu(hb_p, &w.w1, &w.w3, &xb_d, l as i32).generics(generics),
+                )?;
+
+                // x + self.w2(h)
+                let x_part = (&mut x_d).partition([d_ts]);
+
+                let generics = vec![d_ts.to_string(), hd_ts.to_string()];
+                s.record(kernel::matmul_ffn(x_part, &w.w2, &*hb_d, l as i32).generics(generics))?;
+            }
+
+            // final rmsnorm
+            let x_part = (&mut x_d).partition([dim.next_power_of_two()]);
+            s.record(kernel::rmsnorm_inplace(x_part, &w.rms_final_weight))?;
+
+            // classifier into logits
+            let vocab_ts = 32; // vocab_size tile size
+            let d_ts = 64; // dim tile size;
+
+            let logits_p = Arc::get_mut(logits_d).unwrap().partition([vocab_ts]);
+
+            let generics = vec![vocab_ts.to_string(), d_ts.to_string()];
+            s.record(kernel::matmul_cls(logits_p, &w.wcls, &*x_d).generics(generics))?;
+
+            // restore kv cache
+            state.xb_d = Some(xb_d);
+            state.q_d = Some(q_d);
+
+            Ok(())
+        })
+        .unwrap();
+
+        self.graph = Some(graph);
     }
 
-    fn forward(&mut self, token: usize, pos: usize) -> &mut [f32] {
+    fn graph_forward(&mut self, token: usize, pos: usize) {
+        let mut pos_d = &mut self.state.pos_d;
+        let mut x_d = &mut self.state.x_d;
+        let logits_d = &mut self.state.logits_d;
+
+        let pos_p = (&mut pos_d).partition([1]);
+        let x_p = (&mut x_d).partition([self.config.dim.next_power_of_two()]);
+        if let Some(graph) = &self.graph {
+            self.logits = kernel::setup(
+                pos_p,
+                x_p,
+                &self.weights.token_embedding_table,
+                pos as i32,
+                token as i32,
+            )
+            .then(|_| graph.launch())
+            .then(|_| (&*logits_d).to_host_vec())
+            .sync_on(graph.stream())
+            .unwrap();
+        }
+    }
+
+    fn eager_forward(&mut self, token: usize, pos: usize) {
         // a few convenience variables
         let p = &mut self.config;
         let w = &mut self.weights;
@@ -842,8 +1028,20 @@ impl Inference for GpuTransformer {
         // restore kv cache
         s.xb_d = Some(xb_d);
         s.q_d = Some(q_d);
+    }
+}
 
-        // return
+impl Inference for GpuTransformer {
+    fn get_vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+
+    fn forward(&mut self, token: usize, pos: usize) -> &mut [f32] {
+        match self.graph {
+            Some(_) => self.graph_forward(token, pos),
+            None => self.eager_forward(token, pos),
+        }
+
         &mut self.logits
     }
 }

@@ -931,7 +931,11 @@ fn main() {
     // make transformer, tokenizer, sampler
     let mut transformer: Box<dyn Inference> = match mode {
         Mode::Cpu => Box::new(Transformer::from_file(model_path)),
-        Mode::Gpu => Box::new(GpuTransformer::from_file(model_path)),
+        Mode::Gpu => {
+            let mut transformer = GpuTransformer::from_file(model_path);
+            transformer.build_graph();
+            Box::new(transformer)
+        }
     };
     let vocab_size = transformer.get_vocab_size();
 
