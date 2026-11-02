@@ -9,6 +9,25 @@ mod kernel {
     use cutile::core::{reduce_sum, *};
 
     #[cutile::entry()]
+    fn setup<const BM: i32>(
+        pos: &mut Tensor<i32, { [1] }>,
+        x: &mut Tensor<f32, { [BM] }>,
+        w: &Tensor<f32, { [-1, -1] }>, // vocab_size, dim
+        p: i32,
+        token: i32,
+    ) {
+        // set pos
+        let pos_val = broadcast_scalar(p, shape![1]);
+        pos.store(pos_val);
+
+        // copy vocab to x
+        let w_part = w.partition(shape![1, BM]);
+        let tw = w_part.load([token, 0]);
+
+        x.store(tw.reshape(shape![BM]));
+    }
+
+    #[cutile::entry()]
     fn rmsnorm<const BM: i32>(
         y: &mut Tensor<f32, { [BM] }>,
         x: &Tensor<f32, { [-1] }>,     // dim
@@ -72,13 +91,16 @@ mod kernel {
         mut y: MappedPartitionMut<f32, { [1, 1, BM] }, MAP_SHAPE>,
         w: &Tensor<f32, { [-1, -1, -1] }>, // l, kv_dim, dim
         x: &Tensor<f32, { [-1] }>,         // dim
+        pos: &Tensor<i32, { [1] }>,
         l: i32,
-        pos: i32,
     ) {
+        let tp = pos.partition(shape![1]).load([0i32]).reshape(shape![]);
+        let pos_s: i32 = tile_to_scalar(tp); // pos scalar
+
         let w_part = w.partition(shape![1, BM, BM]);
         let x_part = x.partition(shape![BM]);
 
-        for idx in y.iter_indices_within([(l, 1i32), (pos, 1i32), (0i32, -1i32)]) {
+        for idx in y.iter_indices_within([(l, 1i32), (pos_s, 1i32), (0i32, -1i32)]) {
             let (layer, _seq, kv_tile) = idx.components();
 
             let mut ty = constant(0.0f32, shape![BM, 1]);
@@ -97,8 +119,11 @@ mod kernel {
     #[cutile::entry()]
     fn rope_q<const HEAD_TILE: i32, const HEAD_SIZE: i32, const HALF_DIM: i32>(
         q: &mut Tensor<f32, { [1, HEAD_TILE] }>,
-        pos: i32,
+        pos: &Tensor<i32, { [1] }>,
     ) {
+        let tp = pos.partition(shape![1]).load([0i32]).reshape(shape![]);
+        let pos_s: i32 = tile_to_scalar(tp); // pos scalar
+
         let head_dim: Tile<i32, { [HALF_DIM] }> = iota(shape![HALF_DIM]);
         let head_dim: Tile<f32, { [HALF_DIM] }> = convert_tile(head_dim);
         let head_dim = head_dim * constant(2.0f32, shape![HALF_DIM]); // step by 2
@@ -108,7 +133,7 @@ mod kernel {
         let base = constant(10000.0f32, shape![HALF_DIM]);
         let freq = constant(1.0f32, shape![HALF_DIM]) / pow(base, exponent);
 
-        let val = broadcast_scalar(convert_scalar::<f32>(pos), shape![HALF_DIM]) * freq;
+        let val = broadcast_scalar(convert_scalar::<f32>(pos_s), shape![HALF_DIM]) * freq;
         let fcr = cos(val).reshape(shape![HALF_DIM, 1]);
         let fci = sin(val).reshape(shape![HALF_DIM, 1]);
 
@@ -139,9 +164,15 @@ mod kernel {
         // n_layers * seq_len, n_kv_heads, head_size
         mut k: MappedPartitionMut<f32, { [1, 1, HEAD_TILE] }, MAP_SHAPE>,
         k_raw: &Tensor<f32, { [-1, -1] }>, // n_kv_heads, head_size
-        row: i32,
-        pos: i32,
+        pos: &Tensor<i32, { [1] }>,
+        l: i32,
+        seq_len: i32,
     ) {
+        let tp = pos.partition(shape![1]).load([0i32]).reshape(shape![]);
+        let pos_s: i32 = tile_to_scalar(tp); // pos scalar
+
+        let row = l * seq_len + pos_s;
+
         let head_dim: Tile<i32, { [HALF_DIM] }> = iota(shape![HALF_DIM]);
         let head_dim: Tile<f32, { [HALF_DIM] }> = convert_tile(head_dim);
         let head_dim = head_dim * constant(2.0f32, shape![HALF_DIM]); // step by 2
@@ -151,7 +182,7 @@ mod kernel {
         let base = constant(10000.0f32, shape![HALF_DIM]);
         let freq = constant(1.0f32, shape![HALF_DIM]) / pow(base, exponent);
 
-        let val = broadcast_scalar(convert_scalar::<f32>(pos), shape![HALF_DIM]) * freq;
+        let val = broadcast_scalar(convert_scalar::<f32>(pos_s), shape![HALF_DIM]) * freq;
         let fcr = cos(val).reshape(shape![HALF_DIM, 1]);
         let fci = sin(val).reshape(shape![HALF_DIM, 1]);
 
@@ -183,11 +214,14 @@ mod kernel {
         q: &Tensor<f32, { [-1, -1] }>,             // n_heads, head_size
         k: &Tensor<f32, { [-1, -1, -1, -1] }>,     // n_layer, seq_len, n_kv_heads, head_size
         v: &Tensor<f32, { [-1, -1, -1, -1] }>,     // n_layer, seq_len, n_kv_heads, head_size
+        pos: &Tensor<i32, { [1] }>,
         l: i32,
-        pos: i32,
         kv_mul: i32,
         qk_scale: f32,
     ) {
+        let tp = pos.partition(shape![1]).load([0i32]).reshape(shape![]);
+        let pos_s: i32 = tile_to_scalar(tp); // pos scalar
+
         let h_idx = program_id(0);
 
         let two = constant(2.0f32, shape![]);
@@ -205,7 +239,7 @@ mod kernel {
         let mut l_i = constant(0.0f32, shape![1]); // rescale factor
         let mut acc = constant(0.0f32, shape![1, HEAD_TILE]); // accumulation
 
-        let num_tiles = ceil_div(pos + 1, BM);
+        let num_tiles = ceil_div(pos_s + 1, BM);
 
         for j in 0..num_tiles {
             let kv_h_i = h_idx / kv_mul;
@@ -221,7 +255,7 @@ mod kernel {
             let offsets: Tile<i32, { [BM] }> = iota(shape![BM]);
             let token_idx = offsets + broadcast_scalar(j * BM, shape![BM]);
 
-            let valid = lt_tile(token_idx, broadcast_scalar(pos + 1, shape![BM]));
+            let valid = lt_tile(token_idx, broadcast_scalar(pos_s + 1, shape![BM]));
 
             let neg_inf: Tile<f32, { [BM] }> = constant(f32::NEG_INFINITY, shape![BM]);
             let qk = select(valid, qk, neg_inf);
@@ -401,7 +435,7 @@ mod kernel {
 
 struct GpuTransformerWeights {
     // token embedding table
-    token_embedding_table: Vec<f32>, // (vocab_size, dim)
+    token_embedding_table: Tensor<f32>, // (vocab_size, dim)
 
     // weights for rmsnorms
     rms_att_weight: Arc<Tensor<f32>>, // (layer, dim) rmsnorm weights
@@ -428,6 +462,12 @@ struct GpuTransformerWeights {
 impl GpuTransformerWeights {
     fn from_weights(weights_host: &TransformerWeights, c: &Config) -> Self {
         let head_size = c.dim / c.n_heads;
+
+        let token_embedding_table =
+            api::copy_host_vec_to_device(&Arc::new(weights_host.token_embedding_table().to_vec()))
+                .reshape(&[c.vocab_size, c.dim])
+                .sync()
+                .unwrap();
 
         let rms_att_weight =
             api::copy_host_vec_to_device(&Arc::new(weights_host.rms_att_weight().to_vec()))
@@ -493,7 +533,7 @@ impl GpuTransformerWeights {
             .into();
 
         Self {
-            token_embedding_table: weights_host.token_embedding_table().to_vec(),
+            token_embedding_table,
             rms_att_weight,
             rms_ffn_weight,
             wq,
@@ -521,6 +561,8 @@ struct GpuRunState {
     key_raw: Tensor<f32>,       // kv_dim
     hb_d: Tensor<f32>,          // hidden_dim
     logits_d: Arc<Tensor<f32>>, // vocab_size
+
+    pos_d: Tensor<i32>,
 }
 
 impl GpuRunState {
@@ -540,6 +582,8 @@ impl GpuRunState {
         let hb_d = api::zeros::<f32>(&[c.hidden_dim]).sync().unwrap();
         let logits_d = api::zeros::<f32>(&[c.vocab_size]).sync().unwrap();
 
+        let pos_d = api::zeros::<i32>(&[1]).sync().unwrap();
+
         Self {
             key_cache,
             value_cache,
@@ -549,6 +593,7 @@ impl GpuRunState {
             key_raw,
             hb_d,
             logits_d: Arc::new(logits_d),
+            pos_d,
         }
     }
 }
@@ -592,8 +637,7 @@ impl Inference for GpuTransformer {
         let kv_mul = p.n_heads / p.n_kv_heads;
         let head_size = dim / p.n_heads;
 
-        let start = token * dim;
-        let x_h = w.token_embedding_table[start..start + dim].to_owned();
+        let qk_scale = 1.0 / f32::sqrt(head_size as f32);
 
         // buffers
         let mut key_cache = &mut s.key_cache;
@@ -606,13 +650,26 @@ impl Inference for GpuTransformer {
         let mut hb_d = &mut s.hb_d;
         let logits_d = &mut s.logits_d;
 
-        // copy input
-        *x_d = api::copy_host_vec_to_device(&Arc::new(x_h)).sync().unwrap();
+        let mut pos_d = &mut s.pos_d;
 
         // tile size
         let dim_ts = dim.next_power_of_two() / 2;
         let kv_dim_ts = kv_dim.next_power_of_two() / 2;
         let head_size_ts = head_size.next_power_of_two();
+
+        // set pos zero
+        let pos_p = (&mut pos_d).partition([1]);
+        let x_p = (&mut x_d).partition([p.dim.next_power_of_two()]);
+        let _ = kernel::setup(
+            pos_p,
+            x_p,
+            &w.token_embedding_table,
+            pos as i32,
+            token as i32,
+        )
+        .first()
+        .sync()
+        .unwrap();
 
         // forward all the layers
         for l in 0..p.n_layers {
@@ -641,7 +698,7 @@ impl Inference for GpuTransformer {
             let v_p = (&mut val_cache)
                 .partition([1, 1, kv_dim_ts])
                 .map([1, 1, 1], num_tile_blocks as u32);
-            let _ = kernel::matmul_v(v_p, &w.wv, &xb_d, l as i32, pos as i32)
+            let _ = kernel::matmul_v(v_p, &w.wv, &xb_d, &*pos_d, l as i32)
                 .first()
                 .sync()
                 .unwrap();
@@ -655,7 +712,7 @@ impl Inference for GpuTransformer {
                 head_size.to_string(),
                 (head_size_ts / 2).to_string(),
             ];
-            let _ = kernel::rope_q(q_p, pos as i32)
+            let _ = kernel::rope_q(q_p, &*pos_d)
                 .generics(generics)
                 .first()
                 .sync()
@@ -678,7 +735,7 @@ impl Inference for GpuTransformer {
                 map_shape[2].to_string(),
             ];
 
-            let _ = kernel::rope_k(k_p, &k_raw_v, (l * p.seq_len + pos) as i32, pos as i32)
+            let _ = kernel::rope_k(k_p, &k_raw_v, &*pos_d, l as i32, p.seq_len as i32)
                 .generics(generics)
                 .first()
                 .sync()
@@ -705,15 +762,14 @@ impl Inference for GpuTransformer {
             xb_d = xb_d.reshape(&[p.n_heads, head_size]).unwrap();
             let xb_part = (&mut xb_d).partition([1, head_size_ts]);
 
-            let qk_scale = 1.0 / f32::sqrt(head_size as f32);
             let generics = vec![head_size_ts.to_string(), (4).to_string()];
             let (_, _, _, _, _, _, _, _) = kernel::mha(
                 xb_part,
                 &q_d,
                 &k_v,
                 &v_v,
+                &*pos_d,
                 l as i32,
-                pos as i32,
                 kv_mul as i32,
                 qk_scale,
             )
