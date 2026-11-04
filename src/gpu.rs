@@ -627,10 +627,17 @@ impl GpuTransformer {
         }
     }
 
-    pub fn warnup(&mut self) {
-        match self.graph {
-            Some(_) => self.graph_forward(1, 0),
-            None => self.eager_forward(1, 0),
+    pub fn warmup(&mut self) {
+        let tokens = [1usize, 2, 4, 8, 16];
+        let pos = [0usize, 1, 2, 4, 8];
+
+        for &t in &tokens {
+            for &p in &pos {
+                match self.graph {
+                    Some(_) => self.graph_forward(t, p),
+                    None => self.eager_forward(t, p),
+                }
+            }
         }
     }
 
@@ -659,10 +666,19 @@ impl GpuTransformer {
 
         let pos_d = &mut state.pos_d;
 
-        // tile size
-        let dim_ts = dim.next_power_of_two() / 2;
-        let kv_dim_ts = kv_dim.next_power_of_two() / 2;
+        /* tile size */
+        // Q/K/V matmul, attention output matmul
+        let dim_ts = 16;
+        let kv_dim_ts = 16;
         let num_tile_blocks = kv_dim.div_ceil(kv_dim_ts);
+
+        // attention / FFN RMSNorm
+        let rms_ts = 2048;
+
+        // RoPE
+        let rope_ts = 256;
+
+        // MHA
         let head_size_ts = head_size.next_power_of_two();
 
         // Capture graph
@@ -673,7 +689,7 @@ impl GpuTransformer {
 
             for l in 0..p.n_layers {
                 // attention rmsnorm
-                let xb_p = (&mut xb_d).partition([dim_ts]);
+                let xb_p = (&mut xb_d).partition([rms_ts]);
                 s.record(kernel::rmsnorm(xb_p, &*x_d, &w.rms_att_weight, l as i32))?;
 
                 // qkv matmuls for this position
@@ -690,27 +706,27 @@ impl GpuTransformer {
 
                 // rope q
                 q_d = q_d.reshape(&[p.n_heads, head_size])?;
-                let q_p = (&mut q_d).partition([1, head_size_ts]);
+                let q_p = (&mut q_d).partition([1, rope_ts]);
 
                 let generics = vec![
-                    head_size_ts.to_string(),
+                    rope_ts.to_string(),
                     head_size.to_string(),
-                    (head_size_ts / 2).to_string(),
+                    (rope_ts / 2).to_string(),
                 ];
                 s.record(kernel::rope_q(q_p, &*pos_d).generics(generics))?;
 
                 // rope k
                 let map_shape = [1, 1, 1];
                 let k_p = (&mut key_cache)
-                    .partition([1, 1, head_size_ts])
+                    .partition([1, 1, rope_ts])
                     .map(map_shape, p.n_kv_heads as u32);
 
                 let k_raw_v = key_raw.view(&[p.n_kv_heads, head_size]).unwrap();
 
                 let generics = vec![
-                    head_size_ts.to_string(),
+                    rope_ts.to_string(),
                     head_size.to_string(),
-                    (head_size_ts / 2).to_string(),
+                    (rope_ts / 2).to_string(),
                     map_shape[0].to_string(),
                     map_shape[1].to_string(),
                     map_shape[2].to_string(),
@@ -727,7 +743,7 @@ impl GpuTransformer {
                 xb_d = xb_d.reshape(&[p.n_heads, head_size])?;
                 let xb_part = (&mut xb_d).partition([1, head_size_ts]);
 
-                let generics = vec![head_size_ts.to_string(), (4).to_string()];
+                let generics = vec![head_size_ts.to_string(), (128).to_string()];
                 s.record(
                     kernel::mha(
                         xb_part,
@@ -752,24 +768,27 @@ impl GpuTransformer {
                 s.record(kernel::fmatmul(x_p, &w.wo, &xb_d, l as i32))?;
 
                 // ffn rmsnorm
-                let xb_part = (&mut xb_d).partition([dim_ts]);
+                let xb_part = (&mut xb_d).partition([rms_ts]);
                 s.record(kernel::rmsnorm(xb_part, &*x_d, &w.rms_ffn_weight, l as i32))?;
 
                 // F.silu(self.w1(x)) * self.w3(x)
-                let hd_ts = 64; // hidden dim tile size
-                let d_ts = 64; // dim tile size;
+                let silu_bm = 16;
+                let silu_bk = 16;
 
-                let hb_p = (&mut hb_d).partition([hd_ts]);
+                let hb_p = (&mut hb_d).partition([silu_bm]);
 
-                let generics = vec![hd_ts.to_string(), d_ts.to_string()];
+                let generics = vec![silu_bm.to_string(), silu_bk.to_string()];
                 s.record(
                     kernel::matmul_silu(hb_p, &w.w1, &w.w3, &xb_d, l as i32).generics(generics),
                 )?;
 
                 // x + self.w2(h)
-                let x_part = (&mut x_d).partition([d_ts]);
+                let ffn_bm = 2;
+                let ffn_bk = 256;
 
-                let generics = vec![d_ts.to_string(), hd_ts.to_string()];
+                let x_part = (&mut x_d).partition([ffn_bm]);
+
+                let generics = vec![ffn_bm.to_string(), ffn_bk.to_string()];
                 s.record(kernel::matmul_ffn(x_part, &w.w2, &*hb_d, l as i32).generics(generics))?;
             }
 
@@ -778,8 +797,8 @@ impl GpuTransformer {
             s.record(kernel::rmsnorm_inplace(x_part, &w.rms_final_weight))?;
 
             // classifier into logits
-            let vocab_ts = 32; // vocab_size tile size
-            let d_ts = 64; // dim tile size;
+            let vocab_ts = 64; // vocab_size tile size
+            let d_ts = 128; // dim tile size;
 
             let logits_p = Arc::get_mut(logits_d).unwrap().partition([vocab_ts]);
 

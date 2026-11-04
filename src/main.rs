@@ -1,11 +1,13 @@
 // To download the model...
 // wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin
+// wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories110M.bin
 
 use std::fs::File;
 use std::io::{Read, Write};
 use std::ops::Range;
 use std::path::Path;
 use std::process::exit;
+use std::time::Instant;
 use std::{fs, io};
 
 use crate::gpu::GpuTransformer;
@@ -855,7 +857,15 @@ fn generate(
     let mut next;
     let mut token = prompt_tokens[0];
     let mut pos = 0;
+
+    // wct
+    let mut start = Instant::now();
+
     while pos < steps {
+        if pos == 1 {
+            start = Instant::now();
+        }
+
         // forward the transformer to get logits for the next token
         let logits: &mut [f32] = transformer.forward(token, pos);
 
@@ -879,7 +889,14 @@ fn generate(
         safe_print(piece).expect("Failed to flush stdout!");
         token = next;
     }
-    println!()
+    println!();
+
+    let elapsed = start.elapsed();
+
+    if pos > 0 {
+        let num_token = (pos - 1) as f32;
+        println!("achieved tok/s: {}", num_token / elapsed.as_secs_f32());
+    }
 }
 
 fn run(
@@ -899,12 +916,12 @@ fn run(
     loop {
         print!("prompt> ");
         io::stdout().flush().expect("Flush error!");
-        
+
         let mut prompt = String::new();
         if io::stdin().read_line(&mut prompt).expect("Input failed!") == 0 {
             break;
         }
-        
+
         let input = prompt.trim_end_matches(['\r', '\n']);
 
         generate(transformer, tokenizer, sampler, input.as_bytes(), steps);
@@ -963,7 +980,7 @@ fn main() {
         Mode::Gpu => {
             let mut transformer = GpuTransformer::from_file(model_path);
             transformer.build_graph();
-            transformer.warnup();
+            transformer.warmup();
             Box::new(transformer)
         }
     };
